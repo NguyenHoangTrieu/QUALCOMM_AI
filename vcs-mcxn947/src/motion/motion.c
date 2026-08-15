@@ -65,7 +65,7 @@ static float s_safeStopRampStartPct;
 
 static dg_motion_status_t s_lastStatus;
 
-static uint8_t SpeedCapForState(dg_vehicle_state_t state, dg_link_state_t link) {
+uint8_t Motion_GetSpeedCap(dg_vehicle_state_t state, dg_link_state_t link) {
   /* VEH-020 NORMATIVE table. Fault/e-stop/init/disarmed/stopped/decel are
    * all "no commanded motion" states handled by the caller before this is
    * consulted (see Motion_Tick) — this function only answers "what's the
@@ -305,7 +305,7 @@ void Motion_Tick(uint32_t dt_ms, dg_vehicle_state_t state, dg_link_state_t link,
 
     if (state == kDgVehRun || state == kDgVehLimited) {
       GPIO_PinWrite(MOTION_EN_GPIO, MOTION_EN_PIN, 1U);
-      uint8_t cap = SpeedCapForState(state, link);
+      uint8_t cap = Motion_GetSpeedCap(state, link);
       TickChannel(&s_left, setpoint->left_pct, cap);
       TickChannel(&s_right, setpoint->right_pct, cap);
     } else {
@@ -317,7 +317,7 @@ void Motion_Tick(uint32_t dt_ms, dg_vehicle_state_t state, dg_link_state_t link,
     }
   }
 
-  s_lastStatus.speed_cap_pct   = SpeedCapForState(state, link);
+  s_lastStatus.speed_cap_pct   = Motion_GetSpeedCap(state, link);
   s_lastStatus.duty_left_pct   = (uint8_t)s_left.currentDutyPct;
   s_lastStatus.dir_left_reverse  = (s_left.currentSign < 0);
   s_lastStatus.duty_right_pct  = (uint8_t)s_right.currentDutyPct;

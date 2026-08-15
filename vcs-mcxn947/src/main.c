@@ -54,10 +54,15 @@
 
 /* Gas/brake pedal simulation (SW2/SW3, see app.h). Braking is deliberately
  * faster than accelerating (matches real-vehicle feel and the existing
- * MOTION_RAMP_PCT_PER_TICK=40 %/s safe-stop ramp's order of magnitude). */
+ * MOTION_RAMP_PCT_PER_TICK=40 %/s safe-stop ramp's order of magnitude).
+ * COAST (2026-08-16): releasing BOTH gas and brake is its own case, not
+ * "hold the last setpoint" -- a real car with nobody on the pedals slows
+ * down on its own (engine braking / rolling friction), it doesn't cruise
+ * forever. Slower than an active brake press, faster than doing nothing. */
 #define THROTTLE_MAX_PCT       (100.0f)
 #define GAS_RAMP_PCT_PER_S     (20.0f)
 #define BRAKE_RAMP_PCT_PER_S   (40.0f)
+#define COAST_RAMP_PCT_PER_S   (10.0f)
 
 typedef struct {
   GPIO_Type *gpio;
@@ -123,14 +128,20 @@ static void ControlTask(void *pv) {
     prevGas   = gas;
     prevBrake = brake;
 
-    /* Hold-to-drive throttle (VEH-011): holding gas ramps up at
-     * GAS_RAMP_PCT_PER_S, holding brake ramps down at BRAKE_RAMP_PCT_PER_S,
-     * mutually exclusive, brake wins on a simultaneous press. */
+    /* Hold-to-drive throttle (VEH-011, extended 2026-08-16): three cases,
+     * not two -- holding gas ramps up at GAS_RAMP_PCT_PER_S; holding brake
+     * ramps down at BRAKE_RAMP_PCT_PER_S (fastest); releasing BOTH coasts
+     * down at COAST_RAMP_PCT_PER_S instead of holding the last setpoint --
+     * only an active gas press ever raises this value again, exactly like
+     * letting off the pedal on a real car. Brake wins on a simultaneous
+     * press with gas. */
     const float dt_s = (float)CONTROL_TICK_MS / 1000.0f;
     if (brake) {
       s_throttleSetpointPct -= BRAKE_RAMP_PCT_PER_S * dt_s;
     } else if (gas) {
       s_throttleSetpointPct += GAS_RAMP_PCT_PER_S * dt_s;
+    } else {
+      s_throttleSetpointPct -= COAST_RAMP_PCT_PER_S * dt_s;
     }
     if (s_throttleSetpointPct < 0.0f) {
       s_throttleSetpointPct = 0.0f;
@@ -157,6 +168,27 @@ static void ControlTask(void *pv) {
 
     dg_vehicle_state_t state = Safety_GetState();
     dg_link_state_t link     = CanLink_GetLinkState();
+
+    /* Sticky speed cap (2026-08-16, explicit product requirement: "tuyệt
+     * đối không quay lại tốc độ ban đầu khi hết cảnh báo"). Motion_Tick()'s
+     * cap (VEH-020) is a live ceiling re-read every tick -- left alone, a
+     * LIMITED-then-RUN round trip (alert fires, then clears) would ramp the
+     * ACTUAL duty back up toward the still-high setpoint the instant the
+     * cap loosens again, with no fresh gas press involved at all. Clamp the
+     * persistent setpoint itself down whenever it exceeds the current cap,
+     * so that recovery is permanent: once an alert has forced it down, only
+     * the gas branch above can ever raise it again. Only meaningful while
+     * actually driving (RUN/LIMITED) -- every other state already forces
+     * actual duty to 0 in motion.c regardless of this value, and clamping
+     * against the default state cap (0) here would zero out a setpoint
+     * that's legitimately ramping up in ARMED_IDLE ahead of a throttle-
+     * gated ArmedIdle -> RUN transition. */
+    if (state == kDgVehRun || state == kDgVehLimited) {
+      uint8_t cap = Motion_GetSpeedCap(state, link);
+      if (s_throttleSetpointPct > (float)cap) {
+        s_throttleSetpointPct = (float)cap;
+      }
+    }
 
     int8_t throttlePct = (int8_t)s_throttleSetpointPct; /* 0..100, always forward */
     dg_throttle_setpoint_t setpoint = {throttlePct, throttlePct};
