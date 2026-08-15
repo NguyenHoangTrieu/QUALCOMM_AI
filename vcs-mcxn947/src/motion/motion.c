@@ -161,6 +161,19 @@ void Motion_Init(void) {
   const pwm_channels_t kLeftChannels[2]  = {kPWM_PwmA, kPWM_PwmB}; /* RPWM, LPWM */
   const pwm_channels_t kChannelAOnly[1]  = {kPWM_PwmA};
 
+  /* Debug: print the actual clock frequency PWM_SetupPwm() is being told
+   * to compute the 20 kHz prescaler/period from -- added 2026-08-15 while
+   * chasing "no pulse on ANY PWM1 channel, including the already-working
+   * buzzer" with everything else (pin mux, OUTEN, LDOK bitmask) already
+   * confirmed matching the SDK's own proven reference example. If this
+   * prints 0 or an implausible value, BOARD_BootClockPLL100M() not setting
+   * kCLOCK_DivBusClk (only kCLOCK_DivAhbClk) is the likely root cause --
+   * CLOCK_GetFreq(kCLOCK_BusClk) would be feeding PWM_SetupPwm() a stale/
+   * wrong source frequency, producing a garbage or zero period register
+   * regardless of how correct every other PWM1 register write is. */
+  PRINTF("[motion] MOTION_PWM_SRC_CLK_FREQ = %u Hz (should be tens of MHz, "
+         "not 0 and not >150000000)\r\n", (unsigned int)MOTION_PWM_SRC_CLK_FREQ);
+
   InitPwmSubmodule(kPWM_Module_0, kLeftChannels, 2U); /* left RPWM+LPWM */
   InitPwmSubmodule(kPWM_Module_1, kChannelAOnly, 1U); /* right RPWM */
   InitPwmSubmodule(kPWM_Module_3, kChannelAOnly, 1U); /* right LPWM */

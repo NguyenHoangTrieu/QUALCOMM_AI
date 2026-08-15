@@ -135,8 +135,15 @@ static void EvaluateFaults(uint32_t now_ms, const dg_safety_inputs_t *in) {
    * this firmware never senses it, by design. */
   s_faults.estop_active = s_canEstopLatched;
 
+  /* fault_can_timeout only means something once a DMS-AP peer has actually
+   * been seen at least once (2026-08-15: standalone gas/brake-only bench
+   * testing, no CAN peer ever attached, must not be treated as a timeout
+   * fault -- see Safety_Tick()'s level-fallback comment for the matching
+   * logic on the vehicle-state side). */
+  dg_dms_status_t dmsUnused;
+  bool everHadDms = CanLink_GetLatestDmsStatus(&dmsUnused);
   dg_link_state_t link = CanLink_GetLinkState();
-  s_faults.fault_can_timeout = (link == kDgLinkLost);
+  s_faults.fault_can_timeout = everHadDms && (link == kDgLinkLost);
 }
 
 static bool AnyFaultActive(void) {
@@ -175,12 +182,21 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
   bool haveDms      = CanLink_GetLatestDmsStatus(&dms);
   dg_link_state_t link = CanLink_GetLinkState();
 
-  /* CAN-063: absence of a valid frame is NEVER L0. If we have never had a
-   * valid frame, or the link is currently lost, treat the driver state as
-   * unknown/worst-case for every decision below. */
+  /* CAN-063: absence of a valid frame is NEVER treated as "driver is fine"
+   * -- but only once a DMS-AP peer has been seen on the bus at least once.
+   * If no DMS-AP has EVER connected (haveDms stays false forever -- e.g.
+   * standalone gas/brake-only motor bench testing, 2026-08-15, no CAN peer
+   * attached at all), that's "no monitor attached yet", not "danger": SW2/
+   * SW3 alone can drive the motors without ever needing a CAN peer first.
+   * Once a DMS-AP HAS been seen and then goes silent, CAN-063's original
+   * strict fail-safe applies in full below (level forced to L3, a lost
+   * link forces DECEL) -- losing an established monitor is genuinely
+   * dangerous, "never had one" is not. */
   bool driverStateKnown = haveDms && (link != kDgLinkLost);
-  dg_alert_level_t level = driverStateKnown ? dms.alert_level : kDgAlertL3Danger;
-  bool calibDone          = haveDms && dms.flag_calib_done;
+  dg_alert_level_t level = driverStateKnown  ? dms.alert_level
+                            : haveDms        ? kDgAlertL3Danger
+                                              : kDgAlertL0Normal;
+  bool linkLostDangerous = haveDms && (link == kDgLinkLost);
   bool autoRearm          = SafeConditionsSustained(now_ms, driverStateKnown, level, link);
 
   /* E-stop pre-empts everything except INIT (still self-testing). Only
@@ -193,6 +209,15 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
     }
     s_state = kDgVehEstop;
   }
+
+  /* Debug: log EVERY vehicle_state transition, not just the ones the switch
+   * below already PRINTFs individually -- added 2026-08-15 because
+   * RUN<->LIMITED (driven by alert_level/link from the DMS) had no log at
+   * all, making it impossible to see from the console whether a signal
+   * received from the UNO Q was actually changing anything. Generic
+   * before/after compare catches every transition regardless of which
+   * branch caused it. */
+  dg_vehicle_state_t stateBeforeTick = s_state;
 
   switch (s_state) {
     case kDgVehInit:
@@ -207,21 +232,16 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
         s_state = kDgVehFault;
         break;
       }
-      /* No re-arm button anymore -- calib_done=1 alone is enough to arm
-       * (2026-08-15 simplification, was VEH-011's "button AND calib_done"). */
-      if (calibDone) {
-        s_state = kDgVehArmedIdle;
-        PRINTF("[safety] armed\r\n");
-      }
+      /* No re-arm button, no calib_done gate anymore (2026-08-15
+       * simplification -- was VEH-011's "button AND calib_done"). Arms
+       * immediately: gas/brake alone should drive the motors with nothing
+       * else to configure first. */
+      s_state = kDgVehArmedIdle;
       break;
 
     case kDgVehArmedIdle:
       if (AnyFaultActive()) {
         s_state = kDgVehFault;
-        break;
-      }
-      if (!calibDone) {
-        s_state = kDgVehDisarmed;
         break;
       }
       if (inputs->throttle_nonzero) {
@@ -247,14 +267,12 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
         s_state = kDgVehFault;
         break;
       }
-      if (level == kDgAlertL3Danger || link == kDgLinkLost) {
+      if (level == kDgAlertL3Danger || linkLostDangerous) {
         s_state = kDgVehDecel; /* VEH-040, CAN-062 */
-        PRINTF("[safety] -> DECEL (level=%u link=%u)\r\n", (unsigned int)level,
-               (unsigned int)link);
         break;
       }
       if (level == kDgAlertL1Early || level == kDgAlertL2Drowsy ||
-          link == kDgLinkDegraded) {
+          (haveDms && link == kDgLinkDegraded)) {
         s_state = kDgVehLimited;
       } else {
         s_state = kDgVehRun;
@@ -283,7 +301,6 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
       if (autoRearm) {
         s_state = kDgVehArmedIdle;
         s_faults = (dg_fault_flags_t){0};
-        PRINTF("[safety] auto re-armed from STOPPED\r\n");
       }
       break;
 
@@ -300,7 +317,6 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
       if (!AnyFaultActive()) {
         s_state = kDgVehDisarmed;
         s_faults = (dg_fault_flags_t){0};
-        PRINTF("[safety] fault cleared, back to DISARMED\r\n");
       }
       break;
 
@@ -309,7 +325,6 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
         s_canEstopLatched = false;
         s_faults.estop_active = false;
         s_state = kDgVehDisarmed;
-        PRINTF("[safety] e-stop auto-cleared -> DISARMED\r\n");
       }
       break;
 
@@ -318,6 +333,15 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
              (int)s_state);
       s_state = kDgVehFault;
       break;
+  }
+
+  if (s_state != stateBeforeTick) {
+    static const char *const kStateNames[] = {"INIT",   "DISARMED", "ARMED_IDLE", "RUN",
+                                               "LIMITED", "DECEL",    "STOPPED",    "LINK_LOST",
+                                               "FAULT",   "ESTOP"};
+    PRINTF("[safety] state %s -> %s (level=%u link=%u haveDms=%u)\r\n",
+           kStateNames[(unsigned int)stateBeforeTick], kStateNames[(unsigned int)s_state],
+           (unsigned int)level, (unsigned int)link, (unsigned int)haveDms);
   }
 
   (void)AlertLevelAtOrAbove; /* reserved for future per-level distraction

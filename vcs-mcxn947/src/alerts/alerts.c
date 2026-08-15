@@ -11,8 +11,12 @@
 #include "alerts.h"
 
 #include "app.h"
+#include "fsl_debug_console.h"
 #include "fsl_gpio.h"
 #include "fsl_pwm.h"
+
+#include "FreeRTOS.h"
+#include "task.h"
 
 typedef enum {
   kCondFault = 0, /* FAULT or ESTOP vehicle state -- highest priority */
@@ -38,9 +42,16 @@ static void BuzzerInit(void) {
   pwmConfig.reloadLogic           = kPWM_ReloadPwmFullCycle;
   pwmConfig.pairOperation         = kPWM_Independent;
   pwmConfig.enableDebugMode       = true;
-  pwmConfig.clockSource           = kPWM_Submodule0Clock;
-  pwmConfig.prescale              = kPWM_Prescale_Divide_1;
-  pwmConfig.initializationControl = kPWM_Initialize_MasterSync;
+  /* Debug 2026-08-15: was `kPWM_Submodule0Clock` + `kPWM_Initialize_MasterSync`,
+   * making this submodule (SM2) a *follower* that needs SM0 (motion.c's
+   * left motor channel) to generate a working master sync pulse before SM2
+   * ever runs -- meaning a buzzer-only test could never actually prove
+   * "does PWM1 work" independent of the motor channels. Removed: leaving
+   * clockSource/prescale/initializationControl at PWM_GetDefaultConfig()'s
+   * plain defaults makes SM2 fully self-contained, same shape as how SM0
+   * itself is configured in motion.c's InitPwmSubmodule(). If the buzzer
+   * comes up on its own now, the master-sync dependency (or something
+   * about SM0 specifically) was the real root cause all along. */
   (void)PWM_Init(BUZZER_PWM_BASEADDR, kPWM_Module_2, &pwmConfig);
 
   pwm_signal_param_t signal;

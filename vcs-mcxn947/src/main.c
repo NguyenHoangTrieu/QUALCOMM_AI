@@ -101,6 +101,8 @@ static uint32_t NowMs(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; }
 
 static void ControlTask(void *pv) {
   (void)pv;
+  bool prevGas   = false;
+  bool prevBrake = false;
 
   PRINTF("[control] control_task started (100 Hz)\r\n");
 
@@ -110,22 +112,30 @@ static void ControlTask(void *pv) {
     bool gas   = DebounceUpdate(&s_gasButton);
     bool brake = DebounceUpdate(&s_brakeButton);
 
-    /* Gas/brake are mutually exclusive (SW2 vs. SW3, onboard buttons) --
-     * brake wins on a simultaneous press, the standard real-vehicle
-     * tie-break. Persistent ramp, not an instant snap-to-duty: holding gas
-     * accelerates at GAS_RAMP_PCT_PER_S, holding brake decelerates at
-     * BRAKE_RAMP_PCT_PER_S, releasing both holds the current setpoint. */
-    bool brakeActive = brake;
-    bool gasActive    = gas && !brake;
-    if (gasActive) {
-      s_throttleSetpointPct += GAS_RAMP_PCT_PER_S * ((float)CONTROL_TICK_MS / 1000.0f);
-    } else if (brakeActive) {
-      s_throttleSetpointPct -= BRAKE_RAMP_PCT_PER_S * ((float)CONTROL_TICK_MS / 1000.0f);
+    /* Debug log on every press/release edge (debounced), not every tick --
+     * added 2026-08-15 so pressing SW2/SW3 is visible on the console. */
+    if (gas != prevGas) {
+      PRINTF("[control] SW2 (gas) %s\r\n", gas ? "PRESSED" : "released");
     }
-    if (s_throttleSetpointPct > THROTTLE_MAX_PCT) {
-      s_throttleSetpointPct = THROTTLE_MAX_PCT;
-    } else if (s_throttleSetpointPct < 0.0f) {
+    if (brake != prevBrake) {
+      PRINTF("[control] SW3 (brake) %s\r\n", brake ? "PRESSED" : "released");
+    }
+    prevGas   = gas;
+    prevBrake = brake;
+
+    /* Hold-to-drive throttle (VEH-011): holding gas ramps up at
+     * GAS_RAMP_PCT_PER_S, holding brake ramps down at BRAKE_RAMP_PCT_PER_S,
+     * mutually exclusive, brake wins on a simultaneous press. */
+    const float dt_s = (float)CONTROL_TICK_MS / 1000.0f;
+    if (brake) {
+      s_throttleSetpointPct -= BRAKE_RAMP_PCT_PER_S * dt_s;
+    } else if (gas) {
+      s_throttleSetpointPct += GAS_RAMP_PCT_PER_S * dt_s;
+    }
+    if (s_throttleSetpointPct < 0.0f) {
       s_throttleSetpointPct = 0.0f;
+    } else if (s_throttleSetpointPct > THROTTLE_MAX_PCT) {
+      s_throttleSetpointPct = THROTTLE_MAX_PCT;
     }
 
     dg_safety_inputs_t inputs = {0};
@@ -166,6 +176,7 @@ static void ControlTask(void *pv) {
 static void AlertTask(void *pv) {
   (void)pv;
   PRINTF("[alerts] alert_task started (100 Hz)\r\n");
+
   for (;;) {
     dg_dms_status_t dms;
     bool haveDms = CanLink_GetLatestDmsStatus(&dms);
