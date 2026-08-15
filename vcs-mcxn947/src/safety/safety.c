@@ -203,9 +203,22 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
    * source left is a CAN-received EMERGENCY_STOP (s_faults.estop_active) --
    * see EvaluateFaults()'s comment on why the physical e-stop sense loop is
    * gone. */
+  bool justEnteredEstop = false;
   if (s_state != kDgVehInit && s_faults.estop_active) {
     if (s_state != kDgVehEstop) {
       PRINTF("[safety] -> ESTOP\r\n");
+      /* Bug found 2026-08-16: `autoRearm` above was computed from
+       * s_safeSinceMs as it stood BEFORE this e-stop -- if level/link had
+       * already been safe for >= AUTO_REARM_HOLD_MS a moment ago (the
+       * common case: sim_uart keeps re-injecting L0 regardless of estop
+       * commands), the switch below would see a stale autoRearm==true and
+       * fall straight through ESTOP -> DISARMED in this SAME tick, before
+       * ESTOP was ever actually observed as the settled state. Reset the
+       * timer here (the exact tick of entry) and gate the switch's
+       * recovery check on `justEnteredEstop` below so recovery always needs
+       * a fresh AUTO_REARM_HOLD_MS measured from this moment forward. */
+      s_safeSinceMs = 0U;
+      justEnteredEstop = true;
     }
     s_state = kDgVehEstop;
   }
@@ -321,7 +334,13 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
       break;
 
     case kDgVehEstop:
-      if (autoRearm) {
+      /* justEnteredEstop: never recover on the same tick ESTOP was entered
+       * -- `autoRearm` above may still reflect safe time banked before this
+       * e-stop even though s_safeSinceMs was just reset, since it was
+       * computed earlier in this same function call. Next tick recomputes
+       * autoRearm from the now-reset timer, so recovery still needs a full
+       * fresh AUTO_REARM_HOLD_MS from here. */
+      if (!justEnteredEstop && autoRearm) {
         s_canEstopLatched = false;
         s_faults.estop_active = false;
         s_state = kDgVehDisarmed;
@@ -342,6 +361,16 @@ void Safety_Tick(uint32_t now_ms, const dg_safety_inputs_t *inputs) {
     PRINTF("[safety] state %s -> %s (level=%u link=%u haveDms=%u)\r\n",
            kStateNames[(unsigned int)stateBeforeTick], kStateNames[(unsigned int)s_state],
            (unsigned int)level, (unsigned int)link, (unsigned int)haveDms);
+
+    /* FAULT is entered from inside the switch above (Disarmed/ArmedIdle/
+     * Run/Limited -> Fault), unlike ESTOP which is forced by the pre-empt
+     * block above the switch (and resets s_safeSinceMs right there, see
+     * that comment) -- so this is the first and only place a fresh FAULT
+     * entry can reset the timer before FAULT's own recovery check
+     * (AnyFaultActive(), not autoRearm) is reached on a later tick. */
+    if (s_state == kDgVehFault) {
+      s_safeSinceMs = 0U;
+    }
   }
 
   (void)AlertLevelAtOrAbove; /* reserved for future per-level distraction

@@ -79,13 +79,15 @@ const float CONF_EYE_TH  = 0.20f; // Ngưỡng tin cậy nhận diện nhắm/m�
 const float CONF_YAWN_TH = 0.70f; // Ngưỡng tin cậy nhận diện ngáp
 
 // Thời gian mục tiêu mong muốn (ms)
-const unsigned int TARGET_EYE_WARN_MS  = 1000; // 1.0s -> Nhắc nhở
-const unsigned int TARGET_EYE_ALARM_MS = 2000; // 2.0s -> Báo động nguy hiểm
-const unsigned int TARGET_YAWN_WARN_MS = 1500; // 1.5s -> Nhắc ngáp
+const unsigned int TARGET_EYE_WARN_MS   = 1000; // 1.0s -> Nhắc nhở
+const unsigned int TARGET_EYE_ALARM_MS  = 2000; // 2.0s -> Báo động nguy hiểm
+const unsigned int TARGET_EYE_DANGER_MS = 4000; // 4.0s -> Nguy hiểm cực độ (L3_DANGER)
+const unsigned int TARGET_YAWN_WARN_MS  = 1500; // 1.5s -> Nhắc ngáp
 
 // Số lượng Frame liên tục tự động tính tại setup()
 int EYE_WARN_FRAMES;
 int EYE_ALARM_FRAMES;
+int EYE_DANGER_FRAMES;
 int YAWN_WARN_FRAMES;
 
 // Biến bộ đếm Frame liên tục trên MCU
@@ -202,21 +204,31 @@ void send_dms_bundle(int frame_id, String detections_str) {
         currentYawnFrames = 0; // Reset ngay khi hết ngáp
     }
 
-    // --- B. ĐÁNH GIÁ MỨC CẢNH BÁO (LEVEL 0 - 2) ---
+    // --- B. ĐÁNH GIÁ MỨC CẢNH BÁO (LEVEL 0 - 3) ---
     int alertLevel = 0;
     int alertCode = 100;
 
-    // Ưu tiên 1: Ngủ gật nguy hiểm (Nhắm mắt >= EYE_ALARM_FRAMES, tức >= 5 frames = 2.0s)
-    if (currentEyeClosedFrames >= EYE_ALARM_FRAMES) {
+    // Ưu tiên 1 (2026-08-16, thêm theo yêu cầu): nguy hiểm cực độ -- nhắm
+    // mắt >= EYE_DANGER_FRAMES (>= 10 frames = 4.0s, gấp đôi ngưỡng L2).
+    // Trước đây app này KHÔNG BAO GIỜ tự phát L3_DANGER (dừng ở L2 dù nhắm
+    // mắt bao lâu) -- L3 bên vcs-mcxn947 trước đó chỉ từng xuất hiện qua
+    // fallback CAN-063 khi mất link CAN, chưa bao giờ do chính DMS phán
+    // đoán. Nhánh này lấp đúng khoảng trống đó.
+    if (currentEyeClosedFrames >= EYE_DANGER_FRAMES) {
+        alertLevel = 3;  // DANGER (Ngủ gật nguy hiểm cực độ, kéo dài)
+        alertCode = 300;
+    }
+    // Ưu tiên 2: Ngủ gật nguy hiểm (Nhắm mắt >= EYE_ALARM_FRAMES, tức >= 5 frames = 2.0s)
+    else if (currentEyeClosedFrames >= EYE_ALARM_FRAMES) {
         alertLevel = 2;  // SEVERE_ALARM (Ngủ gật)
         alertCode = 200;
     }
-    // Ưu tiên 2: Nhắc nhở nhắm mắt (EYE_WARN_FRAMES <= frames < EYE_ALARM_FRAMES, tức 3-4 frames)
+    // Ưu tiên 3: Nhắc nhở nhắm mắt (EYE_WARN_FRAMES <= frames < EYE_ALARM_FRAMES, tức 3-4 frames)
     else if (currentEyeClosedFrames >= EYE_WARN_FRAMES) {
         alertLevel = 1;  // LIGHT_WARN (Nhắm mắt)
         alertCode = 102;
     }
-    // Ưu tiên 3: Nhắc ngáp kéo dài (>= YAWN_WARN_FRAMES, tức >= 4 frames = 1.5s)
+    // Ưu tiên 4: Nhắc ngáp kéo dài (>= YAWN_WARN_FRAMES, tức >= 4 frames = 1.5s)
     else if (currentYawnFrames >= YAWN_WARN_FRAMES) {
         alertLevel = 1;  // LIGHT_WARN (Ngáp)
         alertCode = 101;
@@ -224,10 +236,8 @@ void send_dms_bundle(int frame_id, String detections_str) {
 
     int currentSpeed = getVehicleSpeed();
 
-    // alertLevel (0-2) ở đây ánh xạ trực tiếp vào DMS_STATUS.alert_level
-    // (0=L0_NORMAL 1=L1_EARLY 2=L2_DROWSY) qua CAN thật -- app này chưa
-    // bao giờ dùng L3_DANGER (mức tốc-độ-cap thấp nhất bên vcs-mcxn947),
-    // giữ nguyên logic 3 mức gốc, không tự thêm mức mới ngoài yêu cầu.
+    // alertLevel (0-3) ánh xạ trực tiếp vào DMS_STATUS.alert_level
+    // (0=L0_NORMAL 1=L1_EARLY 2=L2_DROWSY 3=L3_DANGER) qua CAN thật.
     // CAN TX thật sự nằm trong loop() (nhịp 100ms riêng, không phụ thuộc
     // tốc độ camera) -- ở đây chỉ cập nhật giá trị mới nhất.
     s_lastAlertLevel = alertLevel;
@@ -262,7 +272,9 @@ void send_dms_bundle(int frame_id, String detections_str) {
         logBoth(packetB);
 
         // Điều khiển Còi báo động vật lý trực tiếp
-        if (alertLevel == 2) {
+        if (alertLevel == 3) {
+            tone(BUZZER_PIN, 3000, 500); // Gắt nhất, 3000Hz kéo dài (Nguy hiểm cực độ)
+        } else if (alertLevel == 2) {
             tone(BUZZER_PIN, 2000, 300); // Tần số gắt 2000Hz (Báo động ngủ gật)
         } else {
             tone(BUZZER_PIN, 1000, 100); // Bíp ngắn 1000Hz (Nhắc nhở nhẹ)
@@ -289,9 +301,10 @@ void setup() {
     }
 
     // 2. TỰ ĐỘNG QUY ĐỔI SỐ FRAME LIÊN TỤC TẠI SETUP
-    EYE_WARN_FRAMES  = ceil((float)TARGET_EYE_WARN_MS / FRAME_TIME_MS);  // ceil(1000/400) = 3 frames
-    EYE_ALARM_FRAMES = ceil((float)TARGET_EYE_ALARM_MS / FRAME_TIME_MS); // ceil(2000/400) = 5 frames
-    YAWN_WARN_FRAMES = ceil((float)TARGET_YAWN_WARN_MS / FRAME_TIME_MS); // ceil(1500/400) = 4 frames
+    EYE_WARN_FRAMES   = ceil((float)TARGET_EYE_WARN_MS / FRAME_TIME_MS);   // ceil(1000/400) = 3 frames
+    EYE_ALARM_FRAMES  = ceil((float)TARGET_EYE_ALARM_MS / FRAME_TIME_MS);  // ceil(2000/400) = 5 frames
+    EYE_DANGER_FRAMES = ceil((float)TARGET_EYE_DANGER_MS / FRAME_TIME_MS); // ceil(4000/400) = 10 frames
+    YAWN_WARN_FRAMES  = ceil((float)TARGET_YAWN_WARN_MS / FRAME_TIME_MS);  // ceil(1500/400) = 4 frames
 
     // Xuất thông số khởi tạo đồng thời ra 3 cổng
     logBoth("==================================================");
@@ -299,6 +312,7 @@ void setup() {
     logBoth("  • Frame Time Input: " + String(FRAME_TIME_MS) + " ms");
     logBoth("  • Eye Warn Limit  : " + String(EYE_WARN_FRAMES) + " frames (1.0s)");
     logBoth("  • Eye Alarm Limit : " + String(EYE_ALARM_FRAMES) + " frames (2.0s)");
+    logBoth("  • Eye Danger Limit: " + String(EYE_DANGER_FRAMES) + " frames (4.0s)");
     logBoth("  • Yawn Warn Limit : " + String(YAWN_WARN_FRAMES) + " frames (1.5s)");
     logBoth("==================================================");
     

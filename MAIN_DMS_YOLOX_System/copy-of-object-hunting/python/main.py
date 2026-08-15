@@ -12,9 +12,51 @@ from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 logger = Logger("DMS_ObjectHunting")
 ui = WebUI()
 camera = Camera(fps=3)
-detection_stream = VideoObjectDetection(camera=camera, debounce_sec=0.5, camera_preview=False)
+detection_stream = VideoObjectDetection(camera=camera, debounce_sec=0.15, camera_preview=False)
 
-ui.on_message("override_th", lambda sid, threshold: detection_stream.override_threshold(threshold))
+# Cấu hình Per-Class Threshold Map (Threshold riêng cho từng nhãn/class trên cùng 1 mô hình)
+# Xử lý thuần túy bằng Python (Built-in dict & conditional filtering, không dùng thư viện ngoài)
+CLASS_THRESHOLDS = {
+    "closed_eye": 0.35,  # Ngưỡng nhạy cho phát hiện nhắm mắt
+    "yawning": 0.45,     # Ngưỡng cho phát hiện ngáp
+    "open_eye": 0.55,    # Ngưỡng nghiêm ngặt hơn cho mở mắt
+    "default": 0.40      # Ngưỡng mặc định cho các nhãn khác
+}
+
+def handle_override_class_th(sid, data):
+    """
+    Lắng nghe sự kiện tùy chỉnh threshold từng class từ Web UI:
+    Data có thể là dict: {"label": "closed_eye", "threshold": 0.35}
+    hoặc dict cập nhật nhiều class: {"closed_eye": 0.35, "yawning": 0.45, "default": 0.40}
+    """
+    if isinstance(data, dict):
+        if "label" in data and "threshold" in data:
+            label = str(data["label"])
+            th = float(data["threshold"])
+            CLASS_THRESHOLDS[label] = th
+            logger.info(f"⚙️ [UI Config] Cập nhật Threshold riêng cho class '{label}' -> {th:.2f}")
+        else:
+            for k, v in data.items():
+                try:
+                    CLASS_THRESHOLDS[str(k)] = float(v)
+                    logger.info(f"⚙️ [UI Config] Cập nhật Threshold riêng cho class '{k}' -> {float(v):.2f}")
+                except (ValueError, TypeError):
+                    pass
+    elif isinstance(data, (int, float)):
+        CLASS_THRESHOLDS["default"] = float(data)
+        logger.info(f"⚙️ [UI Config] Cập nhật Default Threshold -> {float(data):.2f}")
+
+ui.on_message("override_class_th", handle_override_class_th)
+
+def handle_override_th_legacy(sid, threshold):
+    handle_override_class_th(sid, {"label": "default", "threshold": threshold})
+    # Gọi an toàn override_threshold nếu runner dịch vụ đã sẵn sàng
+    try:
+        detection_stream.override_threshold(float(threshold))
+    except Exception as e:
+        logger.warning(f"Chưa thể cập nhật runner threshold tầng dưới: {e}")
+
+ui.on_message("override_th", handle_override_th_legacy)
 
 # Biến toàn cục theo dõi thời gian và đếm khung hình
 last_inference_time = None
@@ -38,13 +80,14 @@ def get_bbox(obj):
         if "xmin" in obj and all(k in obj for k in ("xmin", "ymin", "xmax", "ymax")):
             return [obj.get("xmin"), obj.get("ymin"), obj.get("xmax"), obj.get("ymax")]
     return None
-    
+
 def send_detections_to_ui(detections: dict):
     """
     Hàm xử lý kết quả nhận diện từ YOLOX (Đã tối ưu giảm độ trễ):
     1. Tính toán FPS và hiệu năng xử lý.
-    2. Gom toàn bộ Bounding Box và FPS vào 1 gói tin WebSocket duy nhất gửi Web UI.
-    3. Gom Class & Confidence vào 1 message duy nhất gửi MCU.
+    2. Lọc đối tượng theo Threshold riêng của từng Class (Per-Class Thresholds).
+    3. Gom toàn bộ Bounding Box và FPS vào 1 gói tin WebSocket duy nhất gửi Web UI.
+    4. Gom Class & Confidence vào 1 message duy nhất gửi MCU.
     """
     global last_inference_time, frame_id_counter
     frame_id_counter += 1
@@ -62,18 +105,26 @@ def send_detections_to_ui(detections: dict):
 
     if isinstance(detections, dict):
         for label, object_list in detections.items():
+            str_label = str(label)
+            # Lấy threshold riêng của class này (nếu không có thì lấy threshold default)
+            required_th = CLASS_THRESHOLDS.get(str_label, CLASS_THRESHOLDS.get("default", 0.40))
+
             if isinstance(object_list, list):
                 for obj in object_list:
                     accuracy = get_confidence(obj)
-                    bbox = get_bbox(obj)
-                    item = {
-                        "label": str(label),
-                        "confidence": round(accuracy, 2)
-                    }
-                    if bbox is not None:
-                        item["bbox"] = bbox
-                    boxes_data.append(item)
-                    detection_items.append(f"{label}:{accuracy:.2f}")
+                    
+                    # Lọc theo ngưỡng riêng của từng class
+                    if accuracy >= required_th:
+                        bbox = get_bbox(obj)
+                        item = {
+                            "label": str_label,
+                            "confidence": round(accuracy, 2),
+                            "threshold": round(required_th, 2)
+                        }
+                        if bbox is not None:
+                            item["bbox"] = bbox
+                        boxes_data.append(item)
+                        detection_items.append(f"{str_label}:{accuracy:.2f}")
 
     # Gửi 1 message duy nhất cập nhật UI (Tránh lặp làm ngẽn đường truyền Socket)
     ui.send_message("frame_boxes", message={"boxes": boxes_data, "fps": round(fps, 1)})
@@ -115,9 +166,20 @@ def handle_dismiss_alert(sid, data=None):
     except Exception as e:
         logger.error(f"Lỗi gọi dismiss_alert xuống MCU: {e}")
 
+# Callback tiếp nhận sự kiện tài xế mở mắt trở lại từ MCU
+def on_driver_reopened(speed: int, closed_frames: int):
+    logger.info(f"👁️ [MPU Rx <- MCU EVENT] TÀI XẾ ĐÃ MỞ MẮT TRỞ LẠI! (Nhắm mắt trước đó: {closed_frames} frames, Vận tốc: {speed} km/h)")
+    ui.send_message("dms_event", message={
+        "type": "EYES_REOPENED",
+        "speed": speed,
+        "closed_frames": closed_frames,
+        "timestamp": datetime.now(UTC).isoformat()
+    })
+
 Bridge.provide("on_mcu_ack", on_mcu_ack)
 Bridge.provide("on_dms_config", on_dms_config)
 Bridge.provide("on_mcu_telemetry", on_mcu_telemetry)
+Bridge.provide("on_driver_reopened", on_driver_reopened)
 
 ui.on_message("dismiss_alert", handle_dismiss_alert)
 
