@@ -194,7 +194,6 @@ ui.on_message('dms_event', (eventData) => {
     });
   }
 });
-
 // -------------------------------------------------------------
 // 5. CAMERA IFRAME & CANVAS BOUNDING BOX RENDERER
 // -------------------------------------------------------------
@@ -233,7 +232,7 @@ function handleFrameBoxes(data) {
   if (fpsValEl && data.fps !== undefined) fpsValEl.textContent = data.fps;
   if (detCountEl && data.boxes) detCountEl.textContent = data.boxes.length;
 
-  if (data.boxes && data.boxes.length > 0) {
+    if (data.boxes && data.boxes.length > 0) {
     data.boxes.forEach(b => {
       handleDetectionLog({ content: b.label, accuracy: b.confidence });
     });
@@ -263,6 +262,7 @@ function handleFrameBoxes(data) {
     } else {
       x1 = bbox[0]; y1 = bbox[1]; x2 = bbox[2]; y2 = bbox[3];
     }
+
 
     const boxW = x2 - x1;
     const boxH = y2 - y1;

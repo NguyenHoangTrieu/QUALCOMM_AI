@@ -1,18 +1,28 @@
 // DrowsyGuard DMS-RT -- STM32U585 side of the Arduino UNO Q.
 //
-// Scratch/test copy of ../../QUALCOMM_AI/DrowsyGuard-EdgeAI-HackTheChallenge2026/dms-ap/app/sketch/sketch.ino
+// Deploy-ready. Started as a scratch/test copy of
+// ../../QUALCOMM_AI/DrowsyGuard-EdgeAI-HackTheChallenge2026/dms-ap/app/sketch/sketch.ino
 // with the one piece that file explicitly left unimplemented now filled
-// in: FDCAN1. See ../README.md for the full history of how this got here
-// (short version: a hand-rolled Zephyr `zephyr/drivers/can.h` version was
-// tried first and failed on real hardware with "device not ready" --
-// because `&fdcan1` in Arduino's own shipped board overlay has
-// `zephyr,deferred-init;`, so it needs an explicit `device_init()` this
-// sketch never called. Then Arduino's own first-party `CAN` library
-// (`libraries/CAN/CAN.h`, shipped inside the `arduino:zephyr` core package
-// itself, with `CANRead`/`CANWrite`/`CANEvent` examples) was found, which
-// handles all of that internally -- this file now uses that instead of raw
-// Zephyr calls, and IS CONFIRMED WORKING on real hardware bidirectionally
-// against a real vcs-mcxn947 board, 2026-08-15).
+// in and CONFIRMED WORKING ON REAL HARDWARE (2026-08-15, both directions,
+// against a real vcs-mcxn947 board over a real CAN bus): FDCAN1.
+//
+// FDCAN1 uses Arduino's own first-party `CAN` library (`CAN.h`, shipped
+// inside the `arduino:zephyr` core package itself, with `CANRead`/
+// `CANWrite`/`CANEvent` examples) rather than raw Zephyr driver calls --
+// see ../README.md "How FDCAN1 actually got working" for the two wrong
+// turns that preceded this (raw Zephyr `zephyr/drivers/can.h` calls
+// compiled but failed at runtime with "device not ready": the board's own
+// shipped devicetree marks `&fdcan1` `zephyr,deferred-init`, needing an
+// explicit `device_init()` this library calls internally via
+// `CAN.begin()`, along with setting the bitrate to 500 kbit/s -- the
+// board default is 125 kbit/s).
+//
+// External hardware this sketch assumes is already wired (see
+// ../README.md "Hardware setup that is CONFIRMED to work" for exactly
+// what was used and why): a CAN transceiver on D4(TX)/D5(RX) -- the UNO Q
+// has no onboard one, unlike vcs-mcxn947's onboard TJA1057 -- bridging to
+// vcs-mcxn947's CAN_H/CAN_L (J10), 120 ohm termination at each physical
+// bus end (CAN-002).
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
@@ -38,18 +48,15 @@ static uint32_t s_dmsStatusTxFailCount = 0;
 //
 // CAN.begin(CanBitRate::BR_500k) (see setup()) handles device_init() for
 // the board's `zephyr,deferred-init` FDCAN1 node, sets the bitrate to
-// 500 kbit/s (the board default is 125 kbit/s -- CAN-001 needs 500k), and
-// starts the controller in classic (non-FD) mode, all internally -- no
-// devicetree overlay or Kconfig fragment needed from this sketch at all,
-// unlike what an earlier version of this file assumed. Deliberately no
-// addReceiveFilter() call: the ZephyrCAN wrapper only tracks ONE standard
-// (11-bit) filter at a time (a subsequent call replaces the previous one,
-// per CAN.h's own doc comment) -- since this sketch needs 3 different
-// standard IDs (VCS_STATUS/VCS_EVENT/EMERGENCY_STOP), it's simpler and
-// just as correct to accept every standard frame (the library's own
-// documented behaviour with no filter configured) and dispatch on `id`
-// inside OnCanReceive() below, same as vcs-mcxn947/src/can_link/can_link.c
-// dispatching by mailbox index.
+// 500 kbit/s (CAN-001), and starts the controller in classic (non-FD)
+// mode, all internally. Deliberately no addReceiveFilter() call: the
+// ZephyrCAN wrapper only tracks ONE standard (11-bit) filter at a time (a
+// subsequent call replaces the previous one, per CAN.h's own doc comment)
+// -- since this sketch needs 3 different standard IDs (VCS_STATUS/
+// VCS_EVENT/EMERGENCY_STOP), it's simpler and just as correct to accept
+// every standard frame (the library's own documented no-filter behaviour)
+// and dispatch on `id` inside OnCanReceive() below, same as
+// vcs-mcxn947/src/can_link/can_link.c dispatching by mailbox index.
 //
 // CAN.onReceive()'s callback "is executed in a dedicated worker thread,
 // never in ISR context" (CAN.h's own doc comment) -- unlike a raw Zephyr
@@ -78,9 +85,9 @@ static void OnCanReceive(CanFDMsg const &msg, void *user_data) {
     // ap_rt_transport.py has no Bridge.provide("vcs_estop", ...) handler
     // yet (RouterBridgeTransport only registers vcs_status/vcs_event) --
     // known, not-yet-closed gap, not silently invented here. Surfaced on
-    // Serial so it's visible during bring-up either way; wire a
-    // "vcs_estop" Bridge.provide() on the Python side too once that's
-    // needed for real (see ../README.md).
+    // Serial so it's visible either way; wire a "vcs_estop"
+    // Bridge.provide() on the Python side too once that's needed for real
+    // (see ../README.md).
     Serial.print("[can] EMERGENCY_STOP received from VCS, reason=");
     Serial.println(msg.data[0]);
   }
@@ -144,9 +151,7 @@ void setup() {
   // blocking until a USB serial monitor attaches is harmless. This sketch
   // also has to bring up the Bridge link, which an App Lab-deployed,
   // unattended run needs regardless of whether anything is watching
-  // Serial; the canonical sketch.ino already made this same call for the
-  // same reason (see its "No startup handshake" comment) -- don't
-  // reintroduce a blocking wait here either.
+  // Serial.
 
   if (!CAN.begin(CanBitRate::BR_500k)) {
     Serial.println("[can] CAN.begin(BR_500k) failed -- Bridge link still comes up, "
@@ -162,49 +167,7 @@ void setup() {
   Bridge.provide("emergency_stop", on_emergency_stop);
 }
 
-// ---- TEMPORARY bus-level self-test, added 2026-08-15 -------------------
-// Bridge.call("dms_status", ...) only ever arrives once python/main.py is
-// actually running under App Lab on this board's own Linux side, which
-// this dev session has no way to drive directly (no SSH/App Lab access
-// from here). This block sends a real, CRC-valid DMS_STATUS frame every
-// 100 ms independent of Bridge, purely to prove FDCAN1 talks to a real
-// vcs-mcxn947 board on the physical bus right now -- remove this whole
-// block (and s_selfTestSeq/CrC8/SendSelfTestDmsStatus) once python/main.py
-// is confirmed driving real traffic and this is no longer needed.
-static uint8_t Crc8SelfTest(const uint8_t *data, size_t len) {
-  uint8_t crc = 0xFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (uint8_t bit = 0; bit < 8; bit++) {
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
-    }
-  }
-  return (uint8_t)(crc ^ 0xFF);
-}
-
-static uint32_t s_selfTestTxCount = 0;
-static uint8_t s_selfTestSeq = 0;
-
-static void SendSelfTestDmsStatus() {
-  uint8_t payload[8] = {0};
-  payload[0] = (uint8_t)(1 /* L1_EARLY */ | ((s_selfTestSeq & 0x0F) << 4));
-  payload[5] = 100;  // face_conf_pct, not 255 ("no face")
-  payload[7] = Crc8SelfTest(payload, 7);
-  s_selfTestSeq = (uint8_t)((s_selfTestSeq + 1) & 0x0F);
-
-  if (CanSendFrame(CANID_DMS_STATUS, payload, 8)) {
-    s_selfTestTxCount++;
-  }
-}
-// ---- end TEMPORARY block -------------------------------------------------
-
 void loop() {
-  static uint32_t lastSelfTest = 0;
-  if (millis() - lastSelfTest >= 100) {
-    lastSelfTest = millis();
-    SendSelfTestDmsStatus();
-  }
-
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
@@ -212,8 +175,6 @@ void loop() {
     Serial.print(s_dmsStatusCount);
     Serial.print(" can_tx_fail=");
     Serial.print(s_dmsStatusTxFailCount);
-    Serial.print(" self_test_tx=");
-    Serial.print(s_selfTestTxCount);
     Serial.print(" vcs_status_rx=");
     Serial.print(s_vcsStatusRxCount);
     Serial.print(" dutyL=");

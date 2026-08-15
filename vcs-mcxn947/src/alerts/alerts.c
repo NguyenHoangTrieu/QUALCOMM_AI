@@ -102,10 +102,6 @@ static bool Blink(uint32_t elapsedMs, uint32_t periodMs) {
 void Alerts_Init(void) {
   BuzzerInit();
   LedSet(false, true, false); /* boot: green, matches L0 until real data arrives */
-  GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 0U);
-  GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 0U);
-  GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 0U);
-  GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 0U);
 }
 
 static dg_alert_condition_t DeriveCondition(dg_vehicle_state_t vehState,
@@ -149,10 +145,6 @@ void Alerts_Tick(uint32_t dt_ms, dg_vehicle_state_t vehState, dg_alert_level_t l
     case kCondFault:
       BuzzerSetOn(1000U);
       LedSet(Blink(s_elapsedMs, 1000U), false, false);
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 1U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 1U);
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 0U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 0U);
       break;
 
     case kCondLinkLost:
@@ -166,33 +158,18 @@ void Alerts_Tick(uint32_t dt_ms, dg_vehicle_state_t vehState, dg_alert_level_t l
       /* amber = red+green together */
       GPIO_PinWrite(LED_RED_GPIO, LED_RED_PIN, Blink(s_elapsedMs, 500U) ? 0U : 1U);
       GPIO_PinWrite(LED_GREEN_GPIO, LED_GREEN_PIN, Blink(s_elapsedMs, 500U) ? 0U : 1U);
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 0U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 0U);
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 0U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 0U);
       break;
 
     case kCondSensorLost:
       BuzzerSetOff(); /* VEH-032: silent, on purpose */
       LedSet(false, false, Blink(s_elapsedMs, 1000U));
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 0U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 0U);
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 0U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 0U);
       break;
 
-    case kCondL3: {
+    case kCondL3:
       /* 3.2 kHz / 2.4 kHz alternating every 150 ms, continuous. */
-      bool firstHalf = (s_elapsedMs % 300U) < 150U;
-      BuzzerSetOn(firstHalf ? 3200U : 2400U);
+      BuzzerSetOn(((s_elapsedMs % 300U) < 150U) ? 3200U : 2400U);
       LedSet(Blink(s_elapsedMs, 250U), false, false); /* ~4 Hz */
-      bool hazardOn = Blink(s_elapsedMs, 1000U);
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, hazardOn ? 1U : 0U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, hazardOn ? 1U : 0U);
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 1U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 1U);
       break;
-    }
 
     case kCondL2:
       /* 200 ms on / 200 ms off, continuous. */
@@ -202,11 +179,6 @@ void Alerts_Tick(uint32_t dt_ms, dg_vehicle_state_t vehState, dg_alert_level_t l
         BuzzerSetOff();
       }
       LedSet(true, false, false);
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 0U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 0U);
-      /* 500 ms / 1 s duty (VEH-030). */
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, Blink(s_elapsedMs, 1000U) ? 1U : 0U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 1U);
       break;
 
     case kCondL1: {
@@ -221,10 +193,6 @@ void Alerts_Tick(uint32_t dt_ms, dg_vehicle_state_t vehState, dg_alert_level_t l
         BuzzerSetOff();
       }
       LedSet(true, true, false); /* amber = red+green */
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 0U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 0U);
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 0U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 0U);
       break;
     }
 
@@ -232,10 +200,6 @@ void Alerts_Tick(uint32_t dt_ms, dg_vehicle_state_t vehState, dg_alert_level_t l
     default:
       BuzzerSetOff();
       LedSet(false, true, false);
-      GPIO_PinWrite(HAZARD_L_GPIO, HAZARD_L_PIN, 0U);
-      GPIO_PinWrite(HAZARD_R_GPIO, HAZARD_R_PIN, 0U);
-      GPIO_PinWrite(VIBRATION_GPIO, VIBRATION_PIN, 0U);
-      GPIO_PinWrite(FAN_RELAY_GPIO, FAN_RELAY_PIN, 0U);
       break;
   }
 }

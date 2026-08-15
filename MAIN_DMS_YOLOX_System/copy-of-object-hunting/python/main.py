@@ -12,7 +12,7 @@ from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 logger = Logger("DMS_ObjectHunting")
 ui = WebUI()
 camera = Camera(fps=3)
-detection_stream = VideoObjectDetection(camera=camera, debounce_sec=0.15, camera_preview=False)
+detection_stream = VideoObjectDetection(camera=camera, debounce_sec=0.5, camera_preview=False)
 
 ui.on_message("override_th", lambda sid, threshold: detection_stream.override_threshold(threshold))
 
@@ -38,7 +38,7 @@ def get_bbox(obj):
         if "xmin" in obj and all(k in obj for k in ("xmin", "ymin", "xmax", "ymax")):
             return [obj.get("xmin"), obj.get("ymin"), obj.get("xmax"), obj.get("ymax")]
     return None
-
+    
 def send_detections_to_ui(detections: dict):
     """
     Hàm xử lý kết quả nhận diện từ YOLOX (Đã tối ưu giảm độ trễ):
@@ -115,20 +115,9 @@ def handle_dismiss_alert(sid, data=None):
     except Exception as e:
         logger.error(f"Lỗi gọi dismiss_alert xuống MCU: {e}")
 
-# Callback tiếp nhận sự kiện tài xế mở mắt trở lại từ MCU
-def on_driver_reopened(speed: int, closed_frames: int):
-    logger.info(f"👁️ [MPU Rx <- MCU EVENT] TÀI XẾ ĐÃ MỞ MẮT TRỞ LẠI! (Nhắm mắt trước đó: {closed_frames} frames, Vận tốc: {speed} km/h)")
-    ui.send_message("dms_event", message={
-        "type": "EYES_REOPENED",
-        "speed": speed,
-        "closed_frames": closed_frames,
-        "timestamp": datetime.now(UTC).isoformat()
-    })
-
 Bridge.provide("on_mcu_ack", on_mcu_ack)
 Bridge.provide("on_dms_config", on_dms_config)
 Bridge.provide("on_mcu_telemetry", on_mcu_telemetry)
-Bridge.provide("on_driver_reopened", on_driver_reopened)
 
 ui.on_message("dismiss_alert", handle_dismiss_alert)
 

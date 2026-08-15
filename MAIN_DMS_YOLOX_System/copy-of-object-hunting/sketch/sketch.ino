@@ -12,9 +12,60 @@
 
 #include "Arduino_RouterBridge.h"
 #include <math.h>
+#include <CAN.h>
 
 #define BAUD_RATE 115200
 #define BUZZER_PIN 8      // Chân PWM còi báo động trực tiếp trên Arduino
+
+// ======================================================
+// 0. FDCAN1 -> vcs-mcxn947 (real CAN link, added 2026-08-15)
+// ======================================================
+// D4(PA12)=TX, D5(PA11)=RX qua transceiver ngoài (xem
+// ../../../dms-ap-uno-q/README.md "Hardware setup that is CONFIRMED to
+// work" -- cùng board, cùng cách đấu dây, đã test thật trên phần cứng).
+// alertLevel do send_dms_bundle() tính từ YOLOX được bắn thành DMS_STATUS
+// (ICD 0x100) mỗi 100 ms độc lập với tốc độ camera (xem loop()) -- vì
+// FRAME_TIME_MS=400ms chậm hơn nhiều so với chu kỳ 100ms mà vcs-mcxn947
+// mong đợi (CAN-060..066), nếu bắn DMS_STATUS đúng lúc có frame mới thì
+// link bên VCS sẽ liên tục rơi vào DEGRADED. Tách nhịp CAN heartbeat khỏi
+// nhịp AI giải quyết việc này.
+#define CANID_DMS_STATUS (0x100U)
+#define CANID_VCS_STATUS (0x200U)
+
+static uint8_t Crc8(const uint8_t *data, size_t len) {
+    uint8_t crc = 0xFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
+        }
+    }
+    return (uint8_t)(crc ^ 0xFF);
+}
+
+static int s_lastAlertLevel = 0;      // cập nhật bởi send_dms_bundle(), bắn ra CAN bởi loop()
+static uint8_t s_dmsStatusSeq = 0;
+
+// Tốc độ xe THẬT nhận về từ vcs-mcxn947 qua VCS_STATUS (duty_left/duty_right,
+// 0-100%) -- thay cho random-walk giả lập trước đây. vcs-mcxn947 không có
+// cảm biến tốc độ thật (xem vcs-mcxn947/README.md "What is NOT wired yet"),
+// nên đây vẫn là quy đổi duty% -> km/h giả lập, chỉ khác là lấy dữ liệu
+// THẬT qua CAN thay vì random() cục bộ trên UNO Q.
+#define MAX_SPEED_KMH (40)
+static uint8_t s_lastDutyLeft = 0;
+static uint8_t s_lastDutyRight = 0;
+static bool s_haveRealSpeed = false;
+
+static void OnCanReceive(CanFDMsg const &msg, void *user_data) {
+    (void)user_data;
+    if (msg.getStandardId() == CANID_VCS_STATUS && msg.data_length == 8) {
+        s_lastDutyLeft   = msg.data[2] & 0x7F;
+        s_lastDutyRight  = msg.data[3] & 0x7F;
+        s_haveRealSpeed  = true;
+    }
+    // VCS_EVENT/EMERGENCY_STOP: không xử lý ở app này -- xem
+    // dms-ap-uno-q/sketch.ino nếu cần forward các loại frame đó.
+}
 
 // ======================================================
 // 1. CẤU HÌNH THỜI GIAN THỰC TẾ & NGƯỠNG SETUP
@@ -24,7 +75,7 @@
 const unsigned int FRAME_TIME_MS = 400; // Thời gian xử lý thực tế 1 frame (ms)
 
 // Ngưỡng độ tin cậy AI Model (YOLOX) định nghĩa trực tiếp trên MCU
-const float CONF_EYE_TH  = 0.65f; // Ngưỡng tin cậy nhận diện nhắm/mở mắt
+const float CONF_EYE_TH  = 0.20f; // Ngưỡng tin cậy nhận diện nhắm/mở mắt
 const float CONF_YAWN_TH = 0.70f; // Ngưỡng tin cậy nhận diện ngáp
 
 // Thời gian mục tiêu mong muốn (ms)
@@ -42,19 +93,15 @@ int currentEyeClosedFrames = 0;
 int currentYawnFrames = 0;
 bool wasEyeClosedLong = false; // Theo dõi trạng thái đã nhắm mắt lâu trước đó
 
-// Biến giả lập tốc độ xe (km/h)
-int simulatedSpeed = 75;
-unsigned long lastSpeedUpdate = 0;
-
 int getVehicleSpeed() {
-    // Giả lập tốc độ xe biến thiên tự nhiên từ 50 đến 115 km/h mỗi giây
-    if (millis() - lastSpeedUpdate > 1000) {
-        lastSpeedUpdate = millis();
-        simulatedSpeed += random(-3, 4);
-        if (simulatedSpeed < 50) simulatedSpeed = 50;
-        if (simulatedSpeed > 115) simulatedSpeed = 115;
+    // Tốc độ THẬT lấy từ VCS_STATUS qua CAN (xem OnCanReceive ở trên).
+    // Trước khi nhận được VCS_STATUS đầu tiên (chưa nối CAN / vcs-mcxn947
+    // chưa bật) trả về 0, không còn random giả lập nữa.
+    if (!s_haveRealSpeed) {
+        return 0;
     }
-    return simulatedSpeed;
+    int avgDutyPct = ((int)s_lastDutyLeft + (int)s_lastDutyRight) / 2;
+    return (avgDutyPct * MAX_SPEED_KMH) / 100;
 }
 
 // RPC: Tắt cảnh báo khi người dùng chạm màn hình Web UI
@@ -177,6 +224,14 @@ void send_dms_bundle(int frame_id, String detections_str) {
 
     int currentSpeed = getVehicleSpeed();
 
+    // alertLevel (0-2) ở đây ánh xạ trực tiếp vào DMS_STATUS.alert_level
+    // (0=L0_NORMAL 1=L1_EARLY 2=L2_DROWSY) qua CAN thật -- app này chưa
+    // bao giờ dùng L3_DANGER (mức tốc-độ-cap thấp nhất bên vcs-mcxn947),
+    // giữ nguyên logic 3 mức gốc, không tự thêm mức mới ngoài yêu cầu.
+    // CAN TX thật sự nằm trong loop() (nhịp 100ms riêng, không phụ thuộc
+    // tốc độ camera) -- ở đây chỉ cập nhật giá trị mới nhất.
+    s_lastAlertLevel = alertLevel;
+
     // --- B2. GỬI PHẢN HỒI TELEMETRY (ALERT LEVEL & TỐC ĐỘ) LÊN MPU PYTHON ---
     Bridge.notify("on_mcu_telemetry", alertLevel, alertCode, currentSpeed, currentEyeClosedFrames, currentYawnFrames);
 
@@ -222,8 +277,16 @@ void setup() {
     Monitor.begin(BAUD_RATE);
     Serial.begin(BAUD_RATE);
     Serial1.begin(BAUD_RATE);
-    
+
     pinMode(BUZZER_PIN, OUTPUT);
+
+    // FDCAN1 -> vcs-mcxn947 thật (xem khối "0." ở đầu file)
+    if (!CAN.begin(CanBitRate::BR_500k)) {
+        logBoth("[CAN] CAN.begin(BR_500k) THAT BAI -- khong ket noi duoc voi vcs-mcxn947");
+    } else {
+        CAN.onReceive(OnCanReceive, nullptr);
+        logBoth("[CAN] FDCAN1 up 500 kbit/s (classic CAN)");
+    }
 
     // 2. TỰ ĐỘNG QUY ĐỔI SỐ FRAME LIÊN TỤC TẠI SETUP
     EYE_WARN_FRAMES  = ceil((float)TARGET_EYE_WARN_MS / FRAME_TIME_MS);  // ceil(1000/400) = 3 frames
@@ -278,6 +341,31 @@ void loop() {
             if (rxBufferSerial1.length() > 256) {
                 rxBufferSerial1 = ""; // Reset an toàn tránh tràn RAM
             }
+        }
+    }
+
+    // 3. Bắn DMS_STATUS thật lên FDCAN1 mỗi 100ms -- nhịp riêng, KHÔNG chờ
+    // frame camera mới (xem giải thích ở khối "0." đầu file). Luôn dùng
+    // s_lastAlertLevel mới nhất do send_dms_bundle() cập nhật.
+    static unsigned long lastCanTx = 0;
+    if (millis() - lastCanTx >= 100) {
+        lastCanTx = millis();
+
+        uint8_t payload[8] = {0};
+        payload[0] = (uint8_t)((s_lastAlertLevel & 0x0F) | ((s_dmsStatusSeq & 0x0F) << 4));
+        payload[5] = 100; // face_conf_pct, không phải 255 ("no face")
+        payload[7] = Crc8(payload, 7);
+        s_dmsStatusSeq = (uint8_t)((s_dmsStatusSeq + 1) & 0x0F);
+
+        CanMsg msg(CanStandardId(CANID_DMS_STATUS), 8, payload);
+        int rc = CAN.write(msg);
+        static uint32_t txOk = 0, txFail = 0;
+        if (rc > 0) txOk++; else txFail++;
+        static unsigned long lastCanStat = 0;
+        if (millis() - lastCanStat >= 1000) {
+            lastCanStat = millis();
+            logBoth("[CAN] tx_ok=" + String(txOk) + " tx_fail=" + String(txFail) +
+                    " (last rc=" + String(rc) + ")");
         }
     }
 }

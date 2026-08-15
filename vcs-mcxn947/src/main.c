@@ -10,10 +10,11 @@
  *
  * This is a bring-up build (specs/README.md "Rev 0.1, pre-hardware"): the
  * CAN link, safety state machine, motor PWM and alert patterns are real and
- * match the spec byte-for-byte, but there is no live throttle input yet
- * (dg_throttle_setpoint_t is a fixed test value below, see the TODO) and
- * current/voltage sensing is not wired (OI-05-01), so those fault paths
- * are dormant until real hardware is measured.
+ * match the spec byte-for-byte. Throttle is now a real input (2026-08-15):
+ * the board's own onboard SW2/SW3 buttons act as gas/brake, ramping
+ * dg_throttle_setpoint_t up/down each control tick (see ControlTask).
+ * Current/voltage sensing is still not wired (OI-05-01), so those fault
+ * paths are dormant until real hardware is measured.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -51,6 +52,13 @@
 
 #define DEBOUNCE_SAMPLES (3U) /* 3 * 10 ms = 30 ms >= the >=20 ms in VEH-041 */
 
+/* Gas/brake pedal simulation (SW2/SW3, see app.h). Braking is deliberately
+ * faster than accelerating (matches real-vehicle feel and the existing
+ * MOTION_RAMP_PCT_PER_TICK=40 %/s safe-stop ramp's order of magnitude). */
+#define THROTTLE_MAX_PCT       (100.0f)
+#define GAS_RAMP_PCT_PER_S     (20.0f)
+#define BRAKE_RAMP_PCT_PER_S   (40.0f)
+
 typedef struct {
   GPIO_Type *gpio;
   uint32_t pin;
@@ -60,9 +68,15 @@ typedef struct {
   bool debounced;
 } dg_debounced_input_t;
 
-static dg_debounced_input_t s_ackButton   = {ACK_BUTTON_GPIO, ACK_BUTTON_PIN, true};
-static dg_debounced_input_t s_rearmButton = {REARM_BUTTON_GPIO, REARM_BUTTON_PIN, true};
-static dg_debounced_input_t s_estopSense  = {ESTOP_SENSE_GPIO, ESTOP_SENSE_PIN, false};
+static dg_debounced_input_t s_gasButton   = {GAS_BUTTON_GPIO, GAS_BUTTON_PIN, true};
+static dg_debounced_input_t s_brakeButton = {BRAKE_BUTTON_GPIO, BRAKE_BUTTON_PIN, true};
+
+/* Persistent throttle setpoint the gas/brake buttons ramp up/down, [0,100],
+ * always forward (no reverse pedal on this test rig). Lives across control
+ * ticks (unlike the old bench-only fixed {40,40} value it replaces) so
+ * holding gas actually accelerates and holding brake actually decelerates,
+ * instead of snapping to a fixed duty the instant re-arm was held. */
+static float s_throttleSetpointPct = 0.0f;
 
 static bool DebounceUpdate(dg_debounced_input_t *in) {
   bool raw = (GPIO_PinRead(in->gpio, in->pin) != 0U);
@@ -87,46 +101,46 @@ static uint32_t NowMs(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; }
 
 static void ControlTask(void *pv) {
   (void)pv;
-  bool prevAck   = false;
-  bool prevRearm = false;
 
   PRINTF("[control] control_task started (100 Hz)\r\n");
 
   for (;;) {
     uint32_t now_ms = NowMs();
 
-    bool ack   = DebounceUpdate(&s_ackButton);
-    bool rearm = DebounceUpdate(&s_rearmButton);
-    bool estop = DebounceUpdate(&s_estopSense);
+    bool gas   = DebounceUpdate(&s_gasButton);
+    bool brake = DebounceUpdate(&s_brakeButton);
 
-    if (ack && !prevAck) {
-      CanLink_RequestEvent(kDgEventAck);
+    /* Gas/brake are mutually exclusive (SW2 vs. SW3, onboard buttons) --
+     * brake wins on a simultaneous press, the standard real-vehicle
+     * tie-break. Persistent ramp, not an instant snap-to-duty: holding gas
+     * accelerates at GAS_RAMP_PCT_PER_S, holding brake decelerates at
+     * BRAKE_RAMP_PCT_PER_S, releasing both holds the current setpoint. */
+    bool brakeActive = brake;
+    bool gasActive    = gas && !brake;
+    if (gasActive) {
+      s_throttleSetpointPct += GAS_RAMP_PCT_PER_S * ((float)CONTROL_TICK_MS / 1000.0f);
+    } else if (brakeActive) {
+      s_throttleSetpointPct -= BRAKE_RAMP_PCT_PER_S * ((float)CONTROL_TICK_MS / 1000.0f);
     }
-    if (rearm && !prevRearm) {
-      CanLink_RequestEvent(kDgEventOperatorRearm);
+    if (s_throttleSetpointPct > THROTTLE_MAX_PCT) {
+      s_throttleSetpointPct = THROTTLE_MAX_PCT;
+    } else if (s_throttleSetpointPct < 0.0f) {
+      s_throttleSetpointPct = 0.0f;
     }
-    prevAck   = ack;
-    prevRearm = rearm;
 
     dg_safety_inputs_t inputs = {0};
-    inputs.operator_rearm_pressed = rearm;
-    inputs.ack_pressed            = ack;
-    inputs.estop_sense_asserted   = estop;
-    /* TODO: no physical throttle input wired yet -- ARMED_IDLE never sees
-     * throttle_nonzero, so RUN is only reachable via the bench test hook
-     * below until a real throttle/pedal signal exists (see README "What is
-     * NOT wired yet"). motor_current_ma / motor_rail_mv stay 0 = "not
-     * wired" per OI-05-01, which safety.c's EvaluateFaults() treats as "no
-     * reading available", never as an actual fault. */
-    /* Bench-only: hold re-arm to roll. Must NOT be gated on
-     * Safety_GetState() == kDgVehArmedIdle -- once RUN is entered the state
-     * is no longer ArmedIdle, so that gate would flip throttle_nonzero back
-     * to false on the very next tick even while rearm is still held,
-     * bouncing RUN -> ArmedIdle -> RUN every control tick (10 ms) and
-     * pinning motor duty near 0 % forever. throttle_nonzero should reflect
-     * only the raw "is the pretend throttle input asserted" signal; which
+    /* motor_current_ma / motor_rail_mv stay 0 = "not wired" per OI-05-01,
+     * which safety.c's EvaluateFaults() treats as "no reading available",
+     * never as an actual fault -- unrelated to gas/brake, still open. */
+    /* throttle_nonzero reflects the real gas-pedal-derived setpoint. Must
+     * NOT be gated on Safety_GetState() == kDgVehArmedIdle -- once RUN is
+     * entered the state is no longer ArmedIdle, so that gate would flip
+     * throttle_nonzero back to false on the very next tick even while gas
+     * is still held, bouncing RUN -> ArmedIdle -> RUN every control tick
+     * (10 ms) and pinning motor duty near 0 % forever. throttle_nonzero
+     * should reflect only the raw "is throttle asserted" signal; which
      * *states* react to it is safety.c's business, not this input's. */
-    inputs.throttle_nonzero = rearm;
+    inputs.throttle_nonzero = (s_throttleSetpointPct > 0.0f);
 
     CanLink_UpdateSupervisor(now_ms);
     Safety_Tick(now_ms, &inputs);
@@ -134,7 +148,8 @@ static void ControlTask(void *pv) {
     dg_vehicle_state_t state = Safety_GetState();
     dg_link_state_t link     = CanLink_GetLinkState();
 
-    dg_throttle_setpoint_t setpoint = {40, 40}; /* bench-only fixed test value */
+    int8_t throttlePct = (int8_t)s_throttleSetpointPct; /* 0..100, always forward */
+    dg_throttle_setpoint_t setpoint = {throttlePct, throttlePct};
     Motion_Tick(CONTROL_TICK_MS, state, link, &setpoint);
 
     if (state == kDgVehDecel && Motion_SafeStopComplete()) {

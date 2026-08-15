@@ -1,8 +1,8 @@
-name: Copy of Object Hunting
+name: Qualcom_project
 description: Detect a list of object to win the game
 ports: []
 bricks:
 - arduino:video_object_detection:
-    model: ei-model-1086456-7
+    model: ei-model-1086456-9
 - arduino:web_ui: {}
 icon: 🔍
