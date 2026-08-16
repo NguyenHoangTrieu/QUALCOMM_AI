@@ -1,201 +1,116 @@
-# Object Hunting
+# DrowsyGuard — DMS (Driver Monitoring System)
 
-The **Object Hunting Game** is an interactive scavenger hunt that uses real-time object detection. Players must locate specific physical objects in their environment using a USB camera connected to the Arduino UNO Q to win the game.
+DrowsyGuard is a real-time driver drowsiness detection system built on the **Arduino UNO Q**. It runs continuous eye-state / yawn inference on a USB camera feed, makes a time-based alert decision on the MCU, drives a physical buzzer, and broadcasts vehicle-safety status over **CAN bus** to a companion vehicle controller (`vcs-mcxn947`). A live dashboard in the browser mirrors the alert state, vehicle speed, and the raw AI detections.
 
-**Note:** This example requires to be run using **Network Mode** or **Single-Board Computer (SBC) Mode**, since it requires a **USB-C® hub** and a **USB webcam**.
+*This app is a heavily modified fork of Arduino's `object-hunting` example — it now shares almost none of the original game logic. See [Related Projects](#related-projects) for the rest of the DMS stack.*
 
-*This example is based on the Arduino UNO Q, but also works on Arduino VENTUNO Q.*
+## System Architecture
 
-![Object Hunting Game Example](assets/docs_assets/thumbnail.png)
+```
+ USB Camera
+     │
+     ▼
+ Camera + video_object_detection Brick   (Edge Impulse YOLOX Nano, model ei-model-1086456-7)
+     │  detections: { closed_eye, open_eye, yawning }  (per class: list of {confidence, bbox})
+     ▼
+ main.py                                          MPU / Linux side (QRB2210)
+   ├─ per-class confidence filtering (CLASS_THRESHOLDS)
+   ├─ smoothed Inference FPS (15-sample rolling average)
+   ├─ bounding boxes + FPS + detection log  ───────────────►  WebSocket  ───►  Browser UI
+   └─ latest detection bundle
+        └─► bridge-tx thread (non-blocking, coalesced)
+                └─► Bridge.call("send_dms_bundle", frame_id, "label:conf,...")
+                                │
+                                ▼
+ sketch.ino                                       MCU side (STM32U5, Zephyr)
+   ├─ millis()-based drowsiness state machine  →  alert level 0–3
+   ├─ buzzer (tone()/noTone() on pin 8)
+   ├─ DMS_STATUS (CAN ID 0x100), every 100 ms, fixed cadence  ─►  FDCAN1  ─►  vcs-mcxn947
+   ├─ VCS_STATUS (CAN ID 0x200)  ◄───────────────────────────────────────────┘  (wheel duty % → simulated km/h)
+   └─ telemetry (alert_level, speed, eye/yawn counters)
+        └─► Bridge.notify("on_mcu_telemetry", ...) ─► main.py ─► WebSocket ─► Browser UI
+```
 
-## Description
-
-This App creates an interactive game that recognizes real-world objects. It utilizes the `video_objectdetection` Brick to stream video from a USB webcam and perform continuous inference using the **YoloX Nano** model. The web interface challenges the user to find five specific items: **Book, Bottle, Chair, Cup, and Cell Phone**.
-
-**Key features include:**
-
-- Real-time video streaming and object recognition
-- Interactive checklist that updates automatically when items are found
-- Confidence threshold adjustment to tune detection sensitivity
-- "Win" state triggering upon locating all target objects
+The camera pipeline (MPU/Python) and the decision engine (MCU/sketch) run on two different processors bridged by Arduino's `Arduino_RouterBridge`. This split matters: inference is slow and non-deterministic (a few hundred ms/frame), while the CAN link to the vehicle controller expects a steady 100 ms heartbeat — so the alert decision, the buzzer, and the CAN heartbeat all live on the MCU and run on their own clock, independent of camera FPS.
 
 ## Bricks Used
 
-The object hunting game example uses the following Bricks:
-
-- `web_ui`: Brick to create the interactive game interface and handle WebSocket communication.
-- `video_objectdetection`: Brick that manages the USB camera stream, runs the machine learning model, and provides real-time detection results.
+- `web_ui` — serves the dashboard, handles WebSocket messaging with the browser.
+- `video_object_detection` — manages the USB camera, runs the on-device inference model, hosts a live MJPEG preview on port `4912`.
 
 ## Hardware Requirements
 
-### Hardware
-
 - Arduino UNO Q (x1) or Arduino VENTUNO Q (x1)
-- **USB-C® hub with external power (x1)** _(only for UNO Q)_
-- A power supply (5 V, 3 A) for the USB hub (x1) _(only for UNO Q)_
-- **USB Webcam** (x1)
+- **USB-C® hub with external power (x1)** *(required on UNO Q to power the camera)*
+- Power supply for the hub (5 V, 3 A)
+- **USB webcam** (x1) — must be connected **before** the App is started, or it will fail to launch
+- CAN transceiver wired to **D4 (PA12, TX)** / **D5 (PA11, RX)** for the FDCAN1 link to `vcs-mcxn947` (500 kbit/s classic CAN). Without this link, vehicle speed reads 0 and the buzzer/alerts still work locally.
 
-**Important:** A **USB-C® hub is mandatory** for this example to connect the USB Webcam when using the UNO Q.
+## Alert Levels
 
-**Note:** You must connect the USB camera **before** running the App. If the camera is not connected or not detected, the App will fail to start.
+The decision engine (`sketch.ino`) tracks how long the driver's eyes have been continuously closed / how long a yawn has lasted, using `millis()` — not frame counts, so the thresholds below hold regardless of camera FPS or dropped frames.
 
-## How to Use the Example
+| Level | Code | Condition | Buzzer | UI |
+|---|---|---|---|---|
+| L0 — Normal | 100 | default | off | "MONITORING" |
+| L1 — Advisory | 101 / 102 | yawning ≥ 1.5 s, **or** eyes closed 1.0–2.0 s | short 1000 Hz beep | Advisory banner |
+| L2 — Warning | 200 | eyes closed 2.0–4.0 s | 2000 Hz beep | Warning ring |
+| L3 — Danger | 300 | eyes closed ≥ 4.0 s | sustained 3000 Hz tone | Fullscreen danger modal |
 
-1. **Hardware Setup**
+`alert_level` (0–3) is also encoded into the `DMS_STATUS` CAN frame (ID `0x100`) sent every 100 ms to `vcs-mcxn947`, independent of the camera/inference rate.
 
-   Connect your **USB Webcam** to a powered **USB-C® hub** attached to the UNO Q. Ensure the hub is powered to support the camera.
+Tapping anywhere on the alert overlay sends `dismiss_alert` back to the MCU, which resets the counters, silences the buzzer, and pushes a clean `L0` telemetry frame.
 
-   ![Hardware setup](assets/docs_assets/hardware-setup.png)
+## Web Interface
 
-2. **Run the App**
+Two tabs, served at `http://<UNO-Q-IP>:7000`:
 
-   Launch the App from Arduino App Lab.
-   *Note: If the App stops immediately after clicking Run, check your USB camera connection.*
+- **Dashboard Cluster** — a car-instrument-cluster style view: live speedometer (driven by `VCS_STATUS` over CAN), alert overlay with three severity states, tap-to-dismiss.
+- **Camera AI Vision** — live camera feed (embedded via `<iframe>` from the Brick's own MJPEG stream on port `4912`), bounding boxes drawn on a canvas overlay, Inference FPS, detection count, a live detection log, and a confidence threshold slider.
 
-3. **Access the Web Interface**
+## Configuration
 
-   Open the App in your browser at `<UNO-Q-IP-ADDRESS>:7000`. The interface will load, showing the game introduction and the video feed placeholder.
+- **Per-class confidence thresholds** — `CLASS_THRESHOLDS` in `python/main.py` (`closed_eye`, `yawning`, `open_eye`, plus a `default`). Adjustable at runtime from the UI slider (`override_th`) or via the `override_class_th` WebSocket message for per-label tuning.
+- **Camera capture rate** — `Camera(fps=8)` in `python/main.py`. This is a *request* to the USB driver, not a guarantee — the driver may round to its nearest supported mode.
+- **Alert timing** — `TARGET_EYE_WARN_MS` / `TARGET_EYE_ALARM_MS` / `TARGET_EYE_DANGER_MS` / `TARGET_YAWN_WARN_MS` in `sketch/sketch.ino`.
+- **Detection model** — set in `app.yaml` (`arduino:video_object_detection: model: ei-model-1086456-7`), an Edge Impulse-trained YOLOX Nano model for `closed_eye` / `open_eye` / `yawning`.
 
-4. **Start the Game**
+## Getting Started
 
-   Click the **Start Game** button. The interface will switch to the gameplay view, displaying the live video feed and the list of objects to find.
-
-5. **Hunt for Objects**
-
-   Point the camera at the required items (Book, Bottle, Chair, Cup, Cell Phone). When the system detects an object with sufficient confidence, it will automatically mark it as "Found" in the UI.
-
-6.  **Adjust Sensitivity**
-   
-   If the camera is not detecting objects easily, or is detecting them incorrectly, use the **Confidence Level** slider on the right.
-
-   - **Lower value:** Detects objects more easily but may produce false positives.
-   - **Higher value:** Requires a clearer view of the object to trigger a match.
-
-7.  **Win the Game**
-   
-   Once all five objects are checked off the list, a "You found them all!" screen appears. You can click **Play Again** to reset the list and restart.
-
-## How it Works
-
-The application relies on a continuous data pipeline between the hardware, the inference engine, and the web browser.
-
-**High-level data flow:**
-
-```
-   USB Camera   ──►   VideoObjectDetection   ──►   Inference Model (YoloX)
-                              │                           │
-                              │ (MJPEG Stream)            │ (Detection Events)
-                              ▼                           ▼
-                       Frontend (Browser)     ◄──    WebUI Brick
-                              │
-                              └──►   WebSocket (Threshold Control)
-```
-
-- **Video Streaming**: The `video_objectdetection` Brick captures video from the USB camera and hosts a low-latency stream on port `4912`. The frontend embeds this stream via an `<iframe>`.
-- **Inference**: The backend continuously runs the **YoloX Nano** object detection model on the video frames.
-- **Event Handling**: When objects are detected, the backend sends the labels to the frontend via WebSockets.
-- **Game Logic**: The frontend JavaScript compares the received labels against the target list and updates the game state.
-
-## Understanding the Code
-
-### 🔧 Backend (`main.py`)
-
-The Python script initializes the detection engine and bridges the communication between the computer vision model and the web UI.
-
-- **Initialization**: Sets up the WebUI and the Video Object Detection engine.
-- **Threshold Control**: Listens for `override_th` messages from the UI to adjust how strict the model is when identifying objects.
-
-```python
-ui = WebUI()
-detection_stream = VideoObjectDetection()
-
-# Allow the slider in the UI to change detection sensitivity
-ui.on_message("override_th", lambda sid, threshold: detection_stream.override_threshold(threshold))
-```
-
-- **Reporting Detections**: The script registers a callback using `on_detect_all`. Whenever the model identifies objects, this function iterates through them and sends the labels to the frontend.
-
-```python
-def send_detections_to_ui(detections: dict):
-  for key, value in detections.items():
-    entry = {
-      "content": key,
-      "timestamp": datetime.now(UTC).isoformat()
-    }
-    ui.send_message("detection", message=entry)
-
-detection_stream.on_detect_all(send_detections_to_ui)
-```
-
-### 🔧 Frontend (`app.js`)
-
-The web interface handles the game logic. It defines the specific objects required to win the game.
-
-```javascript
-const targetObjects = ['book', 'bottle', 'chair', 'cup', 'cell phone'];
-let foundObjects = [];
-
-function handleDetection(detection) {
-    const detectedObject = detection.content.toLowerCase();
-    
-    // Check if the detected item is a target and not yet found
-    if (targetObjects.includes(detectedObject) && !foundObjects.includes(detectedObject)) {
-        foundObjects.push(detectedObject);
-        updateFoundCounter();
-        checkWinCondition();
-    }
-}
-```
-
-### 🛠️ Customizing the Game
-
-The default model used by the `video_objectdetection` Brick is **YoloX Nano**, trained on the **COCO dataset**. This means the camera can detect approximately 80 different types of objects, not just the five used in this example.
-
-**To change the objects you want to hunt:**
-
-1. **Choose new targets**: You can select any object from the [standard COCO dataset list](https://github.com/amikelive/coco-labels/blob/master/coco-labels-2014_2017.txt) (e.g., `person`, `keyboard`, `mouse`, `backpack`, `banana`).
-
-2. **Update the code**: Open `assets/app.js` and locate the `targetObjects` array:
-
-   ```javascript
-   const targetObjects = ['book', 'bottle', 'chair', 'cup', 'cell phone'];
-   ```
-
-3. **Replace the items**: Substitute the strings with your chosen object names from the COCO list.
-
-   ```javascript
-   const targetObjects = ['person', 'keyboard', 'mouse', 'laptop', 'backpack'];
-   ```
-
-4. (Optional) Update `assets/index.html` to change the icons and text displayed in the game introduction to match your new targets.
+1. **Hardware setup** — connect the USB webcam to a powered USB-C hub on the UNO Q; wire the CAN transceiver to D4/D5 if you want live vehicle speed and CAN-side alerts.
+2. **Run the App** from Arduino App Lab. If it exits immediately, the camera likely isn't detected — check the hub's power connection.
+3. **Open the dashboard** at `http://<UNO-Q-IP-ADDRESS>:7000`.
+4. Switch to **Camera AI Vision** to see the live feed and detection log; use the confidence slider to tune sensitivity.
 
 ## Troubleshooting
 
-### App fails to start or stops immediately
+**App fails to start / exits immediately**
+Almost always a missing USB camera. Confirm it's plugged into a *powered* USB-C hub before launching.
 
-If the application crashes right after launching, it is likely because the **USB Camera** is not detected.
+**Video feed is black or stuck on "Searching Camera Stream..."**
+The feed is a separate MJPEG stream on port `4912`, embedded via `<iframe>`. Confirm your browser isn't blocking that port and that you're on the same network as the board.
 
-**Fix:**
+**Detections seem inaccurate / too sensitive**
+Lower or raise the Confidence Threshold slider. Per-label thresholds (`CLASS_THRESHOLDS`) can be tuned in `main.py` if one class (e.g. `closed_eye`) needs to be more sensitive than others.
 
-1. Ensure the camera is connected to a **powered USB-C hub**.
+**Vehicle speed always shows 0**
+The MCU only reports real speed once it has received at least one `VCS_STATUS` CAN frame from `vcs-mcxn947`. Check the CAN wiring and that `vcs-mcxn947` is powered and running; the serial log will print `[CAN] FDCAN1 up 500 kbit/s` on successful init.
 
-2. Verify the hub has its external power supply connected (5 V, 3 A).
+**Alerts feel delayed or fire too early after changing camera FPS**
+Shouldn't happen — alert timing is measured in real time (`millis()`) on the MCU, not in frame counts, specifically so it stays correct regardless of camera FPS. If you *do* see drift, check for MCU-side clock issues rather than the Python pipeline.
 
-3. Reconnect the camera and try running the App again.
+## Known Limitations
 
-### Video stream is black or not loading
+- **Camera FPS shown in the UI is the configured target, not a live measurement.** Two attempts to measure the true capture rate (browser-side `fetch()` of the MJPEG stream, then a server-side `cv2.VideoCapture` proxy) both failed on real hardware — the stream endpoint doesn't send CORS headers, and the same URL turned out to serve an HTML wrapper page rather than raw MJPEG. The `<iframe>` preview itself is unaffected and works normally; only the numeric FPS readout is a config echo.
+- **`Bridge.call()` thread-safety from a background thread is assumed, not formally documented.** The Python side offloads `Bridge.call()` to a dedicated thread so a slow/blocked MCU call can't stall the inference callback; this has run correctly in on-device testing but isn't confirmed against Arduino's own documentation.
+- **Vehicle speed is simulated.** `vcs-mcxn947` has no physical speed sensor; speed is derived from motor duty-cycle percentage sent over CAN, not a real wheel encoder.
+- **`app.yaml`'s `name`/`description` still reflect the original object-hunting template** and haven't been updated to match this app.
 
-If the game interface loads but the video area remains black or shows "Searching Webcam...":
+## Related Projects
 
-- **Browser Security:** Some browsers block mixed content or insecure frames. Ensure you are not blocking the iframe loading from port `4912`.
-- **Network:** Ensure your computer and the UNO Q are on the same network.
-- **Camera Status:** If the camera was disconnected while the App was running, you must restart the App.
+- **`vcs-mcxn947`** — the vehicle controller this app talks to over CAN (`VCS_STATUS`/`DMS_STATUS`, IDs `0x200`/`0x100`).
+- **`dms-ap-uno-q`** — a sibling DMS implementation using a different AP↔RT transport/ICD layer.
 
-### Objects are not being detected
+## License
 
-If you are pointing the camera at an object but it doesn't register:
-
-- **Check the list:** Ensure the object is one of the targets defined in `app.js`.
-- **Adjust Confidence:** Lower the **Confidence Level** slider. If set too high (e.g., > 0.80), the model requires a perfect angle to trigger a detection.
-- **Lighting:** Ensure the object is well-lit. Shadows or darkness can prevent detection.
-- **Distance:** Move the camera closer or further away. The object should occupy a significant portion of the frame.
+SPDX-License-Identifier: MPL-2.0 — Copyright (C) Arduino S.r.l. and/or its affiliated companies (original template), with substantial modifications for the DrowsyGuard DMS application.
