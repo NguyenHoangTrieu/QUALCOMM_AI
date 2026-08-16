@@ -2,7 +2,9 @@
 #
 # SPDX-License-Identifier: MPL-2.0
 
+import threading
 import time
+from collections import deque
 from datetime import datetime, UTC
 from arduino.app_utils import App, Bridge, Logger
 from arduino.app_peripherals.camera import Camera
@@ -11,7 +13,13 @@ from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 
 logger = Logger("DMS_ObjectHunting")
 ui = WebUI()
-camera = Camera(fps=3)
+# fps=3 la tran cu rat thap so voi kha nang cua YOLOX Nano tren QRB2210.
+# Nang len 8 lam gia tri khoi diem hop ly hon, nhung PHAI do lai FPS thuc
+# te tren phan cung that va chinh lai -- khong co phan cung o day de
+# benchmark truoc khi doi. Logic canh bao tren MCU (sketch.ino) da chuyen
+# sang dem thoi gian bang millis() (thay vi dem so frame) nen an toan khi
+# fps thay doi hoac frame bi drop (xem _bridge_worker ben duoi).
+camera = Camera(fps=8)
 detection_stream = VideoObjectDetection(camera=camera, debounce_sec=0.15, camera_preview=False)
 
 # Cấu hình Per-Class Threshold Map (Threshold riêng cho từng nhãn/class trên cùng 1 mô hình)
@@ -59,8 +67,77 @@ def handle_override_th_legacy(sid, threshold):
 ui.on_message("override_th", handle_override_th_legacy)
 
 # Biến toàn cục theo dõi thời gian và đếm khung hình
-last_inference_time = None
 frame_id_counter = 0
+
+# Cửa sổ trượt lưu timestamp của N frame gần nhất để tính FPS TRUNG BÌNH,
+# thay vì FPS TỨC THỜI (1 / khoảng-cách-2-frame-gần-nhất). FPS tức thời rất
+# nhiễu: chỉ cần 1 frame tới hơi sớm/hơi trễ hơn bình thường (do model,
+# camera, hay GC jitter) là số hiển thị nhảy vọt dù tốc độ xử lý trung bình
+# không đổi. Lấy trung bình trên nhiều mẫu gần nhất cho ra con số ổn định,
+# phản ánh đúng thông lượng xử lý thật của pipeline.
+_FPS_WINDOW = 15
+_frame_timestamps = deque(maxlen=_FPS_WINDOW)
+
+def _compute_fps() -> float:
+    now = time.perf_counter()
+    _frame_timestamps.append(now)
+    if len(_frame_timestamps) < 2:
+        return 0.0
+    elapsed = _frame_timestamps[-1] - _frame_timestamps[0]
+    if elapsed <= 0:
+        return 0.0
+    return (len(_frame_timestamps) - 1) / elapsed
+
+# ======================================================
+# Bridge.call() worker thread (KHÔNG chặn luồng inference)
+# ======================================================
+# Bridge.call("send_dms_bundle", ...) là RPC ĐỒNG BỘ: nó đợi hàm
+# send_dms_bundle() bên MCU chạy xong (bao gồm cả các lệnh logBoth() in ra
+# UART) mới trả về. Gọi trực tiếp trong send_detections_to_ui() -- vốn được
+# gọi thẳng từ pipeline inference của VideoObjectDetection -- nghĩa là mỗi
+# frame camera bị chặn chờ MCU + UART, giới hạn trần FPS thực tế của cả hệ
+# thống xuống dưới cả tốc độ model.
+#
+# Đưa việc gọi Bridge.call() sang 1 thread nền: send_detections_to_ui() chỉ
+# cập nhật "gói tin mới nhất cần gửi" rồi trả về ngay lập tức, không đợi
+# MCU. Nếu 2 frame tới liên tiếp trước khi thread nền kịp gửi xong frame
+# trước, gói cũ bị GHI ĐÈ (chỉ gửi gói mới nhất) thay vì xếp hàng vô hạn --
+# việc này AN TOÀN với logic cảnh báo hiện tại vì MCU đã chuyển sang đếm
+# thời gian bằng millis() (xem sketch.ino) thay vì đếm số lần được gọi.
+#
+# GIẢ ĐỊNH CHƯA KIỂM CHỨNG (không có phần cứng thật ở đây để test): đối
+# tượng `Bridge` từ arduino.app_utils an toàn khi gọi .call() từ một thread
+# khác thread chính của App.run(). Nếu không an toàn (vd nội bộ dùng
+# asyncio event loop của thread chính), cách sửa nhanh là thay
+# threading.Thread bằng cách đẩy vào asyncio.run_coroutine_threadsafe() hoặc
+# một queue được App.run() tự bơm -- không cần đổi lại thiết kế tổng thể.
+_bridge_lock = threading.Lock()
+_bridge_pending = None  # tuple (frame_id, detections_str) hoặc None
+_bridge_wakeup = threading.Event()
+
+def _bridge_worker():
+    global _bridge_pending
+    while True:
+        _bridge_wakeup.wait()
+        with _bridge_lock:
+            item = _bridge_pending
+            _bridge_pending = None
+            _bridge_wakeup.clear()
+        if item is None:
+            continue
+        frame_id, detections_str = item
+        try:
+            Bridge.call("send_dms_bundle", frame_id, detections_str)
+        except Exception as e:
+            logger.error(f"Lỗi gửi Bundle xuống MCU (bridge worker thread): {e}")
+
+threading.Thread(target=_bridge_worker, daemon=True, name="bridge-tx").start()
+
+def _submit_bundle(frame_id: int, detections_str: str):
+    global _bridge_pending
+    with _bridge_lock:
+        _bridge_pending = (frame_id, detections_str)
+    _bridge_wakeup.set()
 
 def get_confidence(obj) -> float:
     """Hàm an toàn lấy độ tin cậy từ đối tượng phát hiện"""
@@ -89,16 +166,9 @@ def send_detections_to_ui(detections: dict):
     3. Gom toàn bộ Bounding Box và FPS vào 1 gói tin WebSocket duy nhất gửi Web UI.
     4. Gom Class & Confidence vào 1 message duy nhất gửi MCU.
     """
-    global last_inference_time, frame_id_counter
+    global frame_id_counter
     frame_id_counter += 1
-    current_time = time.perf_counter()
-
-    if last_inference_time is not None:
-        dt = current_time - last_inference_time
-        fps = 1.0 / dt if dt > 0 else 0.0
-    else:
-        fps = 0.0
-    last_inference_time = current_time
+    fps = _compute_fps()
 
     boxes_data = []
     detection_items = []
@@ -134,14 +204,10 @@ def send_detections_to_ui(detections: dict):
 
     logger.info(f"📤 [MPU Tx -> MCU] Frame #{frame_id_counter} | Detections: {all_detections_str}")
 
-    try:
-        Bridge.call("send_dms_bundle", frame_id_counter, all_detections_str)
-    except Exception as e:
-        logger.error(f"Lỗi gửi Bundle xuống MCU: {e}")
-
-# Callback tiếp nhận phản hồi xác nhận nhận dữ liệu thành công từ MCU
-def on_mcu_ack(ack_msg: str):
-    logger.info(f"📩 [MPU Rx <- MCU ACK] MCU đã xác nhận nhận thành công: {ack_msg}")
+    # Không gọi Bridge.call() trực tiếp ở đây nữa (xem _bridge_worker phía
+    # trên) -- chỉ giao gói tin cho thread nền rồi trả về ngay, để callback
+    # inference này không bao giờ bị chặn chờ MCU/UART.
+    _submit_bundle(frame_id_counter, all_detections_str)
 
 # Callback tiếp nhận phản hồi hoặc thay đổi cấu hình từ UART ngoại vi (qua MCU)
 def on_dms_config(raw_cmd: str):
@@ -176,7 +242,6 @@ def on_driver_reopened(speed: int, closed_frames: int):
         "timestamp": datetime.now(UTC).isoformat()
     })
 
-Bridge.provide("on_mcu_ack", on_mcu_ack)
 Bridge.provide("on_dms_config", on_dms_config)
 Bridge.provide("on_mcu_telemetry", on_mcu_telemetry)
 Bridge.provide("on_driver_reopened", on_driver_reopened)

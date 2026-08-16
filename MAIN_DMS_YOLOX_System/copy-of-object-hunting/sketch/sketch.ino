@@ -2,12 +2,14 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-/* 
+/*
    DMS Master Decision Engine Sketch for Arduino MCU
-   - Nhận Gói A (DMS Bundle) từ MPU Python -> Tự đếm số lượng Frame liên tục
+   - Nhận Gói A (DMS Bundle) từ MPU Python -> Đếm thời gian nhắm mắt/ngáp
+     liên tục bằng millis() (KHÔNG phụ thuộc camera fps).
    - Ra quyết định cảnh báo / Bật còi vật lý.
-   - XUẤT DỮ LIỆU XÁC NHẬN ĐỒNG THỜI RA CẢ 3 CỔNG (MONITOR, SERIAL, SERIAL1) CHO MỖI FRAME
-   - PHẢN HỒI ACK NGƯỢC LÊN MPU PYTHON ĐỂ XÁC NHẬN KẾT NỐI HAI CHIỀU THÀNH CÔNG
+   - Log debug mỗi frame CHỈ ra Monitor (dev-only); sự kiện cảnh báo thật
+     (packetB) mới mirror ra cả 3 cổng (MONITOR, SERIAL, SERIAL1) -- xem
+     giải thích chi tiết tại send_dms_bundle().
 */
 
 #include "Arduino_RouterBridge.h"
@@ -25,10 +27,10 @@
 // work" -- cùng board, cùng cách đấu dây, đã test thật trên phần cứng).
 // alertLevel do send_dms_bundle() tính từ YOLOX được bắn thành DMS_STATUS
 // (ICD 0x100) mỗi 100 ms độc lập với tốc độ camera (xem loop()) -- vì
-// FRAME_TIME_MS=400ms chậm hơn nhiều so với chu kỳ 100ms mà vcs-mcxn947
-// mong đợi (CAN-060..066), nếu bắn DMS_STATUS đúng lúc có frame mới thì
-// link bên VCS sẽ liên tục rơi vào DEGRADED. Tách nhịp CAN heartbeat khỏi
-// nhịp AI giải quyết việc này.
+// camera/YOLOX chạy chậm hơn nhiều (vài trăm ms/frame) so với chu kỳ 100ms
+// mà vcs-mcxn947 mong đợi (CAN-060..066), nếu bắn DMS_STATUS đúng lúc có
+// frame mới thì link bên VCS sẽ liên tục rơi vào DEGRADED. Tách nhịp CAN
+// heartbeat khỏi nhịp AI giải quyết việc này.
 #define CANID_DMS_STATUS (0x100U)
 #define CANID_VCS_STATUS (0x200U)
 
@@ -72,25 +74,31 @@ static void OnCanReceive(CanFDMsg const &msg, void *user_data) {
 // ======================================================
 #define DEBUG_MODE 1 // Set 1: MCU in Label & Confidence nhận từ MPU | Set 0: Tắt debug, hiển thị gọn theo ALERT
 
-const unsigned int FRAME_TIME_MS = 400; // Thời gian xử lý thực tế 1 frame (ms)
-
 // Ngưỡng độ tin cậy AI Model (YOLOX) định nghĩa trực tiếp trên MCU
 const float CONF_EYE_TH  = 0.20f; // Ngưỡng tin cậy nhận diện nhắm/mở mắt
 const float CONF_YAWN_TH = 0.70f; // Ngưỡng tin cậy nhận diện ngáp
 
-// Thời gian mục tiêu mong muốn (ms)
-const unsigned int TARGET_EYE_WARN_MS   = 1000; // 1.0s -> Nhắc nhở
-const unsigned int TARGET_EYE_ALARM_MS  = 2000; // 2.0s -> Báo động nguy hiểm
-const unsigned int TARGET_EYE_DANGER_MS = 4000; // 4.0s -> Nguy hiểm cực độ (L3_DANGER)
-const unsigned int TARGET_YAWN_WARN_MS  = 1500; // 1.5s -> Nhắc ngáp
+// Thời gian mục tiêu mong muốn (ms) -- tính trực tiếp bằng millis(), KHÔNG
+// quy đổi qua số frame nữa. Trước đây các mốc này bị quy đổi ra số frame
+// cố định dựa trên FRAME_TIME_MS=400ms giả định; nếu Camera fps thay đổi
+// (vd tăng fps để tối ưu độ mượt) thì số frame/giây thay đổi theo nhưng
+// hằng số quy đổi thì không, khiến cảnh báo bắn sớm/muộn sai với thời gian
+// thật. Đếm bằng millis() làm cho ngưỡng cảnh báo độc lập hoàn toàn với fps
+// camera, nên có thể tự do tăng fps sau này mà không phá logic cảnh báo.
+const unsigned long TARGET_EYE_WARN_MS   = 1000; // 1.0s -> Nhắc nhở
+const unsigned long TARGET_EYE_ALARM_MS  = 2000; // 2.0s -> Báo động nguy hiểm
+const unsigned long TARGET_EYE_DANGER_MS = 4000; // 4.0s -> Nguy hiểm cực độ (L3_DANGER)
+const unsigned long TARGET_YAWN_WARN_MS  = 1500; // 1.5s -> Nhắc ngáp
 
-// Số lượng Frame liên tục tự động tính tại setup()
-int EYE_WARN_FRAMES;
-int EYE_ALARM_FRAMES;
-int EYE_DANGER_FRAMES;
-int YAWN_WARN_FRAMES;
+// Mốc thời gian (millis()) bắt đầu trạng thái nhắm mắt / ngáp hiện tại.
+// 0 = hiện không ở trạng thái đó. Giữ nguyên qua các frame không có nhãn rõ
+// ràng (không detect được mắt frame đó) để chịu được frame bị mất/debounce,
+// chỉ reset khi có nhãn "mở mắt" tường minh hoặc hết ngáp.
+unsigned long eyeClosedSinceMs = 0;
+unsigned long yawnSinceMs = 0;
 
-// Biến bộ đếm Frame liên tục trên MCU
+// Bộ đếm frame liên tục -- giữ lại CHỈ để hiển thị debug/telemetry cho UI,
+// không còn dùng để ra quyết định cảnh báo (xem eyeClosedSinceMs/yawnSinceMs).
 int currentEyeClosedFrames = 0;
 int currentYawnFrames = 0;
 bool wasEyeClosedLong = false; // Theo dõi trạng thái đã nhắm mắt lâu trước đó
@@ -110,6 +118,8 @@ int getVehicleSpeed() {
 void dismiss_alert() {
     currentEyeClosedFrames = 0;
     currentYawnFrames = 0;
+    eyeClosedSinceMs = 0;
+    yawnSinceMs = 0;
     wasEyeClosedLong = false;
     noTone(BUZZER_PIN);
     logBoth("🖐️ [MCU DISMISS] Người dùng chạm màn hình tắt cảnh báo -> Reset cờ & còi!");
@@ -176,60 +186,73 @@ void send_dms_bundle(int frame_id, String detections_str) {
         }
     }
 
-    // Cập nhật bộ đếm nhắm mắt & phát hiện sự kiện mở mắt trở lại sau khi nhắm lâu
+    unsigned long nowMs = millis();
+
+    // Cập nhật trạng thái nhắm mắt theo THỜI GIAN THỰC & phát hiện sự kiện
+    // mở mắt trở lại sau khi nhắm lâu
     if (isEyeClosed && !isEyeOpen) {
-        currentEyeClosedFrames++;
-        if (currentEyeClosedFrames >= EYE_WARN_FRAMES) {
+        if (eyeClosedSinceMs == 0) eyeClosedSinceMs = nowMs; // bắt đầu tính giờ
+        currentEyeClosedFrames++; // chỉ để hiển thị debug/telemetry
+        if (nowMs - eyeClosedSinceMs >= TARGET_EYE_WARN_MS) {
             wasEyeClosedLong = true; // Đánh dấu đã xảy ra nhắm mắt lâu
         }
     } else if (isEyeOpen) {
         if (wasEyeClosedLong) {
+            unsigned long closedDurationMs = nowMs - eyeClosedSinceMs;
             // TÍN HIỆU PHẢN HỒI: TÀI XẾ ĐÃ MỞ MẮT TRỞ LẠI SAU KHI NHẮM MẮT LÂU
-            String eventLog = "👁️ [MCU EVENT] DRIVER REOPENED EYES AFTER PROLONGED CLOSURE (" + String(currentEyeClosedFrames) + " frames)! RECOVERED.";
+            String eventLog = "👁️ [MCU EVENT] DRIVER REOPENED EYES AFTER PROLONGED CLOSURE (" + String(closedDurationMs) + " ms)! RECOVERED.";
             logBoth(eventLog);
 
             // Gửi sự kiện phản hồi lên MPU Python
             Bridge.notify("on_driver_reopened", getVehicleSpeed(), currentEyeClosedFrames);
             wasEyeClosedLong = false;
         }
-        currentEyeClosedFrames = 0; // Reset đếm frame nhắm mắt
-    } else {
-        if (currentEyeClosedFrames > 0) currentEyeClosedFrames--; // Giảm dần an toàn
+        eyeClosedSinceMs = 0; // Reset mốc thời gian nhắm mắt
+        currentEyeClosedFrames = 0;
     }
+    // Không có nhãn mắt rõ ràng trong frame này (mất detect/debounce) ->
+    // GIỮ NGUYÊN trạng thái đang nhắm mắt (không reset), vì reset ở đây sẽ
+    // khiến bộ đếm thời gian bị "restart" liên tục mỗi khi model bỏ sót một
+    // frame, làm cảnh báo không bao giờ kịp tới ngưỡng thời gian thật.
 
-    // Cập nhật bộ đếm ngáp
+    // Cập nhật trạng thái ngáp theo THỜI GIAN THỰC
     if (isYawning) {
-        currentYawnFrames++;
+        if (yawnSinceMs == 0) yawnSinceMs = nowMs;
+        currentYawnFrames++; // chỉ để hiển thị debug/telemetry
     } else {
-        currentYawnFrames = 0; // Reset ngay khi hết ngáp
+        yawnSinceMs = 0; // Reset ngay khi hết ngáp
+        currentYawnFrames = 0;
     }
 
-    // --- B. ĐÁNH GIÁ MỨC CẢNH BÁO (LEVEL 0 - 3) ---
+    unsigned long eyeClosedDurationMs = (eyeClosedSinceMs != 0) ? (nowMs - eyeClosedSinceMs) : 0;
+    unsigned long yawnDurationMs = (yawnSinceMs != 0) ? (nowMs - yawnSinceMs) : 0;
+
+    // --- B. ĐÁNH GIÁ MỨC CẢNH BÁO (LEVEL 0 - 3) DỰA TRÊN THỜI GIAN THẬT ---
     int alertLevel = 0;
     int alertCode = 100;
 
     // Ưu tiên 1 (2026-08-16, thêm theo yêu cầu): nguy hiểm cực độ -- nhắm
-    // mắt >= EYE_DANGER_FRAMES (>= 10 frames = 4.0s, gấp đôi ngưỡng L2).
+    // mắt liên tục >= TARGET_EYE_DANGER_MS (4.0s, gấp đôi ngưỡng L2).
     // Trước đây app này KHÔNG BAO GIỜ tự phát L3_DANGER (dừng ở L2 dù nhắm
     // mắt bao lâu) -- L3 bên vcs-mcxn947 trước đó chỉ từng xuất hiện qua
     // fallback CAN-063 khi mất link CAN, chưa bao giờ do chính DMS phán
     // đoán. Nhánh này lấp đúng khoảng trống đó.
-    if (currentEyeClosedFrames >= EYE_DANGER_FRAMES) {
+    if (eyeClosedDurationMs >= TARGET_EYE_DANGER_MS) {
         alertLevel = 3;  // DANGER (Ngủ gật nguy hiểm cực độ, kéo dài)
         alertCode = 300;
     }
-    // Ưu tiên 2: Ngủ gật nguy hiểm (Nhắm mắt >= EYE_ALARM_FRAMES, tức >= 5 frames = 2.0s)
-    else if (currentEyeClosedFrames >= EYE_ALARM_FRAMES) {
+    // Ưu tiên 2: Ngủ gật nguy hiểm (Nhắm mắt liên tục >= 2.0s)
+    else if (eyeClosedDurationMs >= TARGET_EYE_ALARM_MS) {
         alertLevel = 2;  // SEVERE_ALARM (Ngủ gật)
         alertCode = 200;
     }
-    // Ưu tiên 3: Nhắc nhở nhắm mắt (EYE_WARN_FRAMES <= frames < EYE_ALARM_FRAMES, tức 3-4 frames)
-    else if (currentEyeClosedFrames >= EYE_WARN_FRAMES) {
+    // Ưu tiên 3: Nhắc nhở nhắm mắt (nhắm liên tục 1.0s - 2.0s)
+    else if (eyeClosedDurationMs >= TARGET_EYE_WARN_MS) {
         alertLevel = 1;  // LIGHT_WARN (Nhắm mắt)
         alertCode = 102;
     }
-    // Ưu tiên 4: Nhắc ngáp kéo dài (>= YAWN_WARN_FRAMES, tức >= 4 frames = 1.5s)
-    else if (currentYawnFrames >= YAWN_WARN_FRAMES) {
+    // Ưu tiên 4: Nhắc ngáp kéo dài (>= 1.5s)
+    else if (yawnDurationMs >= TARGET_YAWN_WARN_MS) {
         alertLevel = 1;  // LIGHT_WARN (Ngáp)
         alertCode = 101;
     }
@@ -247,19 +270,24 @@ void send_dms_bundle(int frame_id, String detections_str) {
 
 #if DEBUG_MODE == 1
     // --- C. LOG DEBUG CHI TIẾT KHI DEBUG_MODE = 1 ---
+    // CHỈ in ra Monitor (dev-only), KHÔNG mirror ra Serial/Serial1 nữa: mỗi
+    // lần logBoth() in ra CẢ 3 cổng UART ở 115200 baud tốn ~10ms MỖI CỔNG
+    // cho một dòng debug dài, mà Bridge.call() ở phía Python (main.py) ĐỢI
+    // ĐỒNG BỘ hàm này chạy xong mới trả về -- nghĩa là mỗi frame camera bị
+    // chặn thêm ~30ms chỉ để in log không ai đọc theo dõi liên tục. Giảm
+    // xuống 1 cổng giúp giải phóng phần lớn thời gian đó, đặc biệt quan
+    // trọng khi tăng fps camera (ngân sách mỗi frame càng nhỏ, overhead
+    // logging cố định càng chiếm tỷ trọng lớn). Sự kiện cảnh báo thật sự
+    // (packetB bên dưới) hiếm hơn nhiều nên vẫn giữ mirror ra cả 3 cổng.
     String debugLog = "🔍 [MCU DEBUG] Frame #" + String(frame_id) +
                       " | Speed: " + String(currentSpeed) + " km/h" +
                       " | Rx: [" + detections_str + "]" +
-                      " | EyeCnt: " + String(currentEyeClosedFrames) +
-                      " | YawnCnt: " + String(currentYawnFrames);
-    logBoth(debugLog);
+                      " | EyeMs: " + String(eyeClosedDurationMs) +
+                      " | YawnMs: " + String(yawnDurationMs);
+    Monitor.println(debugLog);
 #endif
 
-    // --- D. PHẢN HỒI ACK NGƯỢC LÊN MPU ---
-    String ackMsg = "ACK_FRAME_" + String(frame_id);
-    Bridge.notify("on_mcu_ack", ackMsg);
-
-    // --- E. KÍCH HOẠT PHẦN CỨNG & XUẤT GÓI B KHI CÓ CẢNH BÁO ---
+    // --- D. KÍCH HOẠT PHẦN CỨNG & XUẤT GÓI B KHI CÓ CẢNH BÁO ---
     if (alertLevel > 0) {
         String packetB = "   🚨 [DMS_ALERT] SEQ:" + String(frame_id) +
                          ", LEVEL:" + String(alertLevel) +
@@ -300,20 +328,14 @@ void setup() {
         logBoth("[CAN] FDCAN1 up 500 kbit/s (classic CAN)");
     }
 
-    // 2. TỰ ĐỘNG QUY ĐỔI SỐ FRAME LIÊN TỤC TẠI SETUP
-    EYE_WARN_FRAMES   = ceil((float)TARGET_EYE_WARN_MS / FRAME_TIME_MS);   // ceil(1000/400) = 3 frames
-    EYE_ALARM_FRAMES  = ceil((float)TARGET_EYE_ALARM_MS / FRAME_TIME_MS);  // ceil(2000/400) = 5 frames
-    EYE_DANGER_FRAMES = ceil((float)TARGET_EYE_DANGER_MS / FRAME_TIME_MS); // ceil(4000/400) = 10 frames
-    YAWN_WARN_FRAMES  = ceil((float)TARGET_YAWN_WARN_MS / FRAME_TIME_MS);  // ceil(1500/400) = 4 frames
-
     // Xuất thông số khởi tạo đồng thời ra 3 cổng
     logBoth("==================================================");
     logBoth("  DMS MCU MASTER DECISION ENGINE STARTED");
-    logBoth("  • Frame Time Input: " + String(FRAME_TIME_MS) + " ms");
-    logBoth("  • Eye Warn Limit  : " + String(EYE_WARN_FRAMES) + " frames (1.0s)");
-    logBoth("  • Eye Alarm Limit : " + String(EYE_ALARM_FRAMES) + " frames (2.0s)");
-    logBoth("  • Eye Danger Limit: " + String(EYE_DANGER_FRAMES) + " frames (4.0s)");
-    logBoth("  • Yawn Warn Limit : " + String(YAWN_WARN_FRAMES) + " frames (1.5s)");
+    logBoth("  • Timing mode     : millis() thoi gian thuc (khong phu thuoc camera fps)");
+    logBoth("  • Eye Warn Limit  : " + String(TARGET_EYE_WARN_MS) + " ms");
+    logBoth("  • Eye Alarm Limit : " + String(TARGET_EYE_ALARM_MS) + " ms");
+    logBoth("  • Eye Danger Limit: " + String(TARGET_EYE_DANGER_MS) + " ms");
+    logBoth("  • Yawn Warn Limit : " + String(TARGET_YAWN_WARN_MS) + " ms");
     logBoth("==================================================");
     
     Bridge.begin();

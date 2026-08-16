@@ -168,18 +168,24 @@ function handleTelemetry(telemetry) {
     window.setSpeed(telemetry.speed);
   }
 
-  // 2. Chuyển đổi trạng thái cảnh báo từ MCU (0: Normal, 1: Warn, 2: Alarm)
+  // 2. Chuyển đổi trạng thái cảnh báo từ MCU (0=Normal, 1=Advisory, 2=Warning, 3=Danger).
+  // MCU (sketch.ino) giờ tính alertLevel bằng millis() thời gian thực và đã
+  // tự phát đủ cả 4 mức (kể cả L3_DANGER), nên chỉ cần map thẳng 1-1 --
+  // không suy luận lại từ eye_frames/yawn_frames ở đây nữa. Trước đây code
+  // này tự đoán L3 qua "eyeFrames >= 5" (bù cho việc MCU cũ không bao giờ
+  // tự phát L3) và chưa từng map alertLevel===3 tường minh; giờ camera fps
+  // có thể thay đổi và một số frame có thể bị gộp/bỏ trước khi tới MCU
+  // (xem main.py, _bridge_worker), nên eye_frames không còn tỉ lệ ổn định
+  // với thời gian thực -- dùng nó để suy luận cảnh báo ở đây sẽ dễ sai lệch
+  // so với quyết định thật của MCU.
   const alertLevel = telemetry.alert_level || 0;
-  const eyeFrames = telemetry.eye_frames || 0;
 
-  if (alertLevel === 2 || eyeFrames >= 5) {
+  if (alertLevel === 3) {
     setLevel('l3'); // Danger modal
+  } else if (alertLevel === 2) {
+    setLevel('l2'); // Warning ring
   } else if (alertLevel === 1) {
-    if (eyeFrames >= 3) {
-      setLevel('l2'); // Warning ring
-    } else {
-      setLevel('l1'); // Advisory banner
-    }
+    setLevel('l1'); // Advisory banner
   } else {
     setLevel('l0'); // Normal monitoring
   }
